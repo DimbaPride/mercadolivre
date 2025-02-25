@@ -19,6 +19,9 @@ class BlingConfig:
     """Configuração para API do Bling"""
     api_key: str
     base_url: str
+    # Novas configurações para o OAuth
+    client_id: str = None
+    client_secret: str = None
 
 @dataclass
 class WhatsAppConfig:
@@ -34,12 +37,18 @@ class WhatsAppGroup:
     name: str
 
 @dataclass
+class GroqConfig:
+    """Configuração para API Groq (LLM)"""
+    api_key: str
+
+@dataclass
 class Settings:
     """Configurações globais da aplicação"""
     bling: BlingConfig
     whatsapp: WhatsAppConfig
     group: WhatsAppGroup
     check_interval: int
+    groq: GroqConfig = None  # Opcional, pode não estar configurado
 
 def load_settings() -> Settings:
     """Carrega todas as configurações do arquivo .env"""
@@ -47,7 +56,9 @@ def load_settings() -> Settings:
     return Settings(
         bling=BlingConfig(
             api_key=os.getenv('BLING_API_KEY', ''),
-            base_url=os.getenv('BLING_API_URL', 'https://bling.com.br/Api/v2')
+            base_url=os.getenv('BLING_API_URL', 'https://bling.com.br/Api/v3'),
+            client_id=os.getenv('BLING_CLIENT_ID', ''),
+            client_secret=os.getenv('BLING_CLIENT_SECRET', '')
         ),
         whatsapp=WhatsAppConfig(
             api_key=os.getenv('WHATSAPP_API_KEY', '429683C4C977415CAAFCCE10F7D57E11'),
@@ -59,7 +70,10 @@ def load_settings() -> Settings:
             group_id=WHATSAPP_GROUP_ID,
             name=WHATSAPP_GROUP_NAME
         ),
-        check_interval=int(os.getenv('CHECK_INTERVAL', 30))
+        check_interval=int(os.getenv('CHECK_INTERVAL', 30)),
+        groq=GroqConfig(
+            api_key=os.getenv('GROQ_API_KEY', '')
+        ) if os.getenv('GROQ_API_KEY') else None
     )
 
 def validate_settings(settings: Settings) -> bool:
@@ -71,6 +85,9 @@ def validate_settings(settings: Settings) -> bool:
         (settings.whatsapp.instance, 'WHATSAPP_INSTANCE'),
         (settings.group.group_id, 'WHATSAPP_GROUP_ID')
     ]
+    
+    # As novas configurações não são obrigatórias para que o sistema original continue funcionando
+    # Elas são verificadas separadamente quando tentamos inicializar o agente de estoque
     
     for value, name in required_settings:
         if not value:

@@ -6,6 +6,9 @@ from typing import List, Dict, Optional
 from whatsapp_client import create_whatsapp_client, MessageType
 import json
 from fastapi import FastAPI, Request
+import os
+from stock_agent import StockAgent
+from fastapi import Depends, HTTPException, Header
 
 # Configuração do sistema de logs
 logging.basicConfig(
@@ -30,8 +33,9 @@ class WhatsAppGroup:
 # Inicialização do FastAPI para receber webhooks
 app = FastAPI()
 
-# Variável global para acesso ao monitor nos endpoints
+# Variáveis globais para acesso aos componentes nos endpoints
 bling_monitor = None
+stock_agent = None
 
 class BlingStockMonitor:
     def __init__(
@@ -363,10 +367,13 @@ class BlingStockMonitor:
 @app.get("/")
 async def root():
     """Endpoint raiz para verificar se o servidor está em execução"""
-    status = "Inicializado" if bling_monitor else "Não inicializado"
+    monitor_status = "Inicializado" if bling_monitor else "Não inicializado"
+    agent_status = "Inicializado" if stock_agent else "Não inicializado"
+    
     return {
         "status": "online", 
-        "monitor": status, 
+        "monitor": monitor_status,
+        "agent": agent_status,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -465,8 +472,101 @@ async def bling_webhook_principal(request: Request):
         logger.error(f"Traceback: {traceback.format_exc()}")
         return {"status": "error", "message": f"Erro interno: {str(e)}"}
 
+# Novo endpoint para processar mensagens do WhatsApp
+@app.post("/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """
+    Endpoint para receber mensagens do WhatsApp e processá-las com o agente de estoque
+    """
+    if not stock_agent:
+        logger.warning("Agente de estoque não inicializado. Ignorando mensagem.")
+        return {"status": "error", "message": "Agente de estoque não inicializado"}
+    
+    try:
+        # Verifica o content-type
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"Content-Type: {content_type}")
+        
+        # Processa a requisição (formato específico da sua API de WhatsApp)
+        try:
+            if "application/json" in content_type:
+                data = await request.json()
+            elif "application/x-www-form-urlencoded" in content_type:
+                form_data = await request.form()
+                json_data = form_data.get("data")
+                if json_data:
+                    data = json.loads(json_data)
+                else:
+                    return {"status": "error", "message": "Parâmetro 'data' não encontrado"}
+            else:
+                body = await request.body()
+                data = json.loads(body)
+        except Exception as e:
+            logger.error(f"Erro ao processar corpo da requisição: {e}")
+            return {"status": "error", "message": f"Formato de dados inválido: {str(e)}"}
+        
+        # Extrai informações da mensagem
+        # Exemplo de processamento - ajuste conforme a estrutura da sua API de WhatsApp
+        if "messages" in data and len(data["messages"]) > 0:
+            message = data["messages"][0]
+            
+            # Verifica se é uma mensagem de texto
+            if message.get("type") == "text":
+                sender = message.get("from", "")
+                text = message.get("body", "")
+                
+                # Determina se é um grupo
+                is_group = False
+                if "chat" in message and message["chat"].get("isGroup", False):
+                    is_group = True
+                    
+                    # Para mensagens de grupo, verifica se mencionou o bot
+                    if not any(mention in text.lower() for mention in ["@estoque", "@bot", "@stock"]):
+                        logger.info(f"Mensagem de grupo ignorada (sem menção): {text[:30]}...")
+                        return {"status": "success", "message": "Mensagem de grupo sem menção ignorada"}
+                
+                logger.info(f"Mensagem recebida de {sender}: {text[:50]}...")
+                
+                # Processa a mensagem com o agente
+                response = await stock_agent.process_message(sender, text)
+                
+                if response:
+                    # Envia resposta usando o cliente WhatsApp do monitor
+                    if bling_monitor and bling_monitor.whatsapp_client:
+                        await bling_monitor.whatsapp_client.send_message(
+                            text=response,
+                            number=sender,
+                            message_type=MessageType.TEXT,
+                            simulate_typing=True,
+                            delay=1000,
+                            metadata={"isGroup": is_group}
+                        )
+                        logger.info(f"Resposta enviada para {sender}")
+                    else:
+                        logger.error("Monitor não inicializado, não é possível enviar resposta")
+                
+                return {"status": "success", "message": "Mensagem processada"}
+            else:
+                logger.info(f"Mensagem ignorada (tipo não suportado): {message.get('type')}")
+                return {"status": "success", "message": "Tipo de mensagem não suportado"}
+        else:
+            logger.info("Requisição sem mensagens")
+            return {"status": "success", "message": "Sem mensagens para processar"}
+            
+    except Exception as e:
+        logger.error(f"Erro ao processar webhook do WhatsApp: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {"status": "error", "message": f"Erro interno: {str(e)}"}
+
 def initialize_monitor(monitor):
     """Inicializa o monitor global para o webhook"""
     global bling_monitor
     bling_monitor = monitor
     logger.info("Monitor global inicializado com sucesso")
+
+def initialize_stock_agent(agent):
+    """Inicializa o agente de estoque global"""
+    global stock_agent
+    stock_agent = agent
+    logger.info("Agente de estoque global inicializado com sucesso")
