@@ -14,6 +14,9 @@ load_dotenv(dotenv_path=env_path)
 WHATSAPP_GROUP_ID = "120363296510746112@g.us"
 WHATSAPP_GROUP_NAME = "Estoque - Luar Shop"
 
+# Valores fixos para a instância do WhatsApp
+WHATSAPP_INSTANCE_NAME = "Luar Shop"
+WHATSAPP_INSTANCE_ID = "9bc8b989-81cc-4554-aa63-4f07d00caa6b"
 @dataclass
 class BlingConfig:
     """Configuração para API do Bling"""
@@ -28,7 +31,7 @@ class WhatsAppConfig:
     """Configuração para Evolution API"""
     api_key: str
     api_url: str
-    instance: str
+    instance: str  # Usar o nome da instância, não o ID
 
 @dataclass
 class WhatsAppGroup:
@@ -52,7 +55,7 @@ class Settings:
 
 def load_settings() -> Settings:
     """Carrega todas as configurações do arquivo .env"""
-    # Usa valores das variáveis de ambiente, mas sobrescreve com os valores fixos do grupo
+    # Usa valores das variáveis de ambiente, mas sobrescreve com os valores fixos
     return Settings(
         bling=BlingConfig(
             api_key=os.getenv('BLING_API_KEY', ''),
@@ -63,7 +66,7 @@ def load_settings() -> Settings:
         whatsapp=WhatsAppConfig(
             api_key=os.getenv('WHATSAPP_API_KEY', '429683C4C977415CAAFCCE10F7D57E11'),
             api_url=os.getenv('WHATSAPP_API_URL', 'https://evo.ariondigital.com.br'),
-            instance=os.getenv('WHATSAPP_INSTANCE', 'Luar Shop')
+            instance=os.getenv('WHATSAPP_INSTANCE') 
         ),
         group=WhatsAppGroup(
             # Usa os valores fixos definidos acima
@@ -82,7 +85,7 @@ def validate_settings(settings: Settings) -> bool:
         (settings.bling.api_key, 'BLING_API_KEY'),
         (settings.whatsapp.api_key, 'WHATSAPP_API_KEY'),
         (settings.whatsapp.api_url, 'WHATSAPP_API_URL'),
-        (settings.whatsapp.instance, 'WHATSAPP_INSTANCE'),
+        (settings.whatsapp.instance, 'WHATSAPP_INSTANCE'),  # Verifica o nome da instância
         (settings.group.group_id, 'WHATSAPP_GROUP_ID')
     ]
     

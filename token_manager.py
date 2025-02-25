@@ -56,6 +56,12 @@ class BlingTokenManager:
                 with open(self.token_file, "r") as file:
                     self._token_data = json.load(file)
                 logger.info("Token carregado do arquivo")
+                
+                # Verifica se o token tem campo created_at (para compatibilidade com versão anterior)
+                if self._token_data and "created_at" not in self._token_data:
+                    logger.warning("Token carregado não tem campo created_at, adicionando timestamp atual")
+                    self._token_data["created_at"] = datetime.now().timestamp()
+                    self._save_token()
             else:
                 logger.warning(f"Arquivo de token {self.token_file} não encontrado")
         except Exception as e:
@@ -159,6 +165,9 @@ class BlingTokenManager:
             if response.status_code == 200:
                 new_token_data = response.json()
                 
+                # Adiciona timestamp de criação
+                new_token_data["created_at"] = datetime.now().timestamp()
+                
                 with self._token_lock:
                     self._token_data = new_token_data
                 
@@ -175,6 +184,40 @@ class BlingTokenManager:
             logger.error(f"Erro durante renovação do token: {str(e)}")
             return False
     
+    def _is_token_expired_or_expiring_soon(self, threshold_seconds=600):
+        """
+        Verifica se o token está expirado ou prestes a expirar
+        
+        :param threshold_seconds: Tempo limite em segundos (padrão: 10 minutos)
+        :return: True se expirado ou expirando em breve, False caso contrário
+        """
+        if not self._token_data:
+            return True
+            
+        # Verifica se temos os campos necessários
+        if "expires_in" not in self._token_data or "created_at" not in self._token_data:
+            logger.warning("Token não tem campos expires_in ou created_at")
+            return True
+            
+        # Calcula o tempo de vida do token
+        created_timestamp = self._token_data["created_at"]
+        expires_in_seconds = self._token_data["expires_in"]
+        
+        # Calcula quando o token expira
+        expiry_timestamp = created_timestamp + expires_in_seconds
+        current_timestamp = datetime.now().timestamp()
+        
+        # Tempo restante em segundos
+        remaining_seconds = expiry_timestamp - current_timestamp
+        
+        # Verifica se está expirado ou expirando em breve
+        if remaining_seconds <= threshold_seconds:
+            logger.info(f"Token expira em {remaining_seconds:.1f} segundos (abaixo do limite de {threshold_seconds})")
+            return True
+        else:
+            logger.debug(f"Token válido por mais {remaining_seconds:.1f} segundos")
+            return False
+    
     async def get_valid_token(self):
         """
         Obtém um token válido, renovando se necessário
@@ -187,32 +230,46 @@ class BlingTokenManager:
                 logger.error("Não há token disponível")
                 return None
             
-            # Verifica se o token está próximo de expirar (menos de 10 minutos)
-            expires_in = self._token_data.get("expires_in", 0)
-            expiry_threshold = 600  # 10 minutos em segundos
+            # Verifica se o token está expirado ou prestes a expirar
+            needs_renewal = self._is_token_expired_or_expiring_soon()
             
-            if expires_in < expiry_threshold:
-                # Token está próximo de expirar, renova
-                logger.info("Token próximo da expiração, renovando...")
-                
-                # Libera o lock antes de chamar refresh_token para evitar deadlock
-                # já que refresh_token adquire o lock internamente
-            
-        # Tenta renovar o token
-        if expires_in < expiry_threshold:
+        # Tenta renovar o token se necessário
+        if needs_renewal:
+            logger.info("Token expirado ou prestes a expirar, renovando...")
             success = await self.refresh_token()
             if not success:
-                logger.warning("Falha ao renovar token, usando o atual mesmo assim")
+                logger.warning("Falha ao renovar token automaticamente")
+                
+                # Se o token ainda é válido (apenas prestes a expirar), podemos usá-lo
+                with self._token_lock:
+                    if self._token_data and "access_token" in self._token_data:
+                        if not self._is_token_expired_or_expiring_soon(threshold_seconds=0):  # Verifica se já expirou
+                            logger.info("Usando token atual mesmo prestes a expirar")
+                            return self._token_data.get("access_token")
+                        else:
+                            logger.error("Token expirado e falha na renovação")
+                            return None
         
         # Retorna o token atual (renovado ou não)
         with self._token_lock:
-            return self._token_data.get("access_token")
+            token = self._token_data.get("access_token") if self._token_data else None
+            logger.info(f"Retornando token válido: {token[:15]}..." if token else "Nenhum token disponível")
+            return token
     
-    def start_renewal_job(self, interval_hours=5):
+    async def _renew_if_needed(self):
+        """Verifica e renova o token se necessário"""
+        with self._token_lock:
+            needs_renewal = self._is_token_expired_or_expiring_soon(threshold_seconds=1800)  # 30 minutos
+            
+        if needs_renewal:
+            logger.info("Executando renovação programada do token (verificação periódica)")
+            await self.refresh_token()
+    
+    def start_renewal_job(self, interval_hours=1):
         """
         Inicia um job em background para renovação periódica do token
         
-        :param interval_hours: Intervalo em horas para renovação
+        :param interval_hours: Intervalo em horas para verificação (padrão: 1 hora)
         """
         if self._renewal_running:
             logger.info("Job de renovação já está em execução")
@@ -222,16 +279,15 @@ class BlingTokenManager:
         
         async def renewal_job():
             """Job assíncrono para renovação periódica"""
-            logger.info(f"Iniciando job de renovação a cada {interval_hours} horas")
+            logger.info(f"Iniciando job de renovação com verificação a cada {interval_hours} horas")
             
             while self._renewal_running:
                 try:
+                    # Verifica e renova o token se necessário
+                    await self._renew_if_needed()
+                    
                     # Espera pelo intervalo (em segundos)
                     await asyncio.sleep(interval_hours * 60 * 60)
-                    
-                    # Renova o token
-                    logger.info("Executando renovação programada do token")
-                    await self.refresh_token()
                     
                 except asyncio.CancelledError:
                     logger.info("Job de renovação cancelado")
@@ -242,7 +298,8 @@ class BlingTokenManager:
                     await asyncio.sleep(60)  # Espera 1 minuto antes de tentar novamente
         
         # Inicia o job de renovação como uma tarefa assíncrona
-        self._renewal_task = asyncio.create_task(renewal_job())
+        loop = asyncio.get_event_loop()
+        self._renewal_task = loop.create_task(renewal_job())
         logger.info("Job de renovação iniciado")
     
     def stop_renewal_job(self):
@@ -298,6 +355,9 @@ class BlingTokenManager:
             if response.status_code == 200:
                 token_data = response.json()
                 
+                # Adiciona timestamp de criação
+                token_data["created_at"] = datetime.now().timestamp()
+                
                 with self._token_lock:
                     self._token_data = token_data
                 
@@ -314,6 +374,26 @@ class BlingTokenManager:
             logger.error(f"Erro ao obter token inicial: {str(e)}")
             return False
 
+# Função para renovar o token de forma forçada (útil para scripts)
+async def force_token_renewal(client_id, client_secret):
+    """
+    Força a renovação do token do Bling
+    
+    :param client_id: Client ID do aplicativo Bling
+    :param client_secret: Client Secret do aplicativo Bling
+    :return: True se renovado com sucesso, False caso contrário
+    """
+    token_manager = BlingTokenManager(client_id, client_secret)
+    logger.info("Forçando renovação do token Bling...")
+    success = await token_manager.refresh_token()
+    
+    if success:
+        logger.info("Token renovado com sucesso!")
+        return True
+    else:
+        logger.error("Falha ao renovar token!")
+        return False
+
 
 # Exemplo de uso
 if __name__ == "__main__":
@@ -321,8 +401,12 @@ if __name__ == "__main__":
     load_dotenv()
     
     # Credenciais do Bling
-    CLIENT_ID = "48d4b5b7fc8e64fbd1724ce95d97c8a595deea3f"
-    CLIENT_SECRET = "df0444306ed1cfbbedf69abf57bc5140ef24277f0e4e5b8070c08dbb4607"
+    CLIENT_ID = os.environ.get("BLING_CLIENT_ID", "")
+    CLIENT_SECRET = os.environ.get("BLING_CLIENT_SECRET", "")
+    
+    if not CLIENT_ID or not CLIENT_SECRET:
+        logger.error("Variáveis BLING_CLIENT_ID e BLING_CLIENT_SECRET precisam estar definidas")
+        exit(1)
     
     # Função de teste assíncrona
     async def test_token_manager():
@@ -339,7 +423,7 @@ if __name__ == "__main__":
             print(f"Token válido: {token[:15]}...")
             
             # Inicia job de renovação para teste
-            token_manager.start_renewal_job(interval_hours=5)
+            token_manager.start_renewal_job(interval_hours=1)
             
             # Para demonstração, espera 10 segundos
             print("Job de renovação iniciado, esperando 10 segundos...")

@@ -20,12 +20,17 @@ class WhatsAppClient:
         Cliente para a Evolution API do WhatsApp
         :param api_key: Chave de API da Evolution API
         :param api_url: URL base da Evolution API
-        :param instance: Nome ou ID da instância do WhatsApp
+        :param instance: Nome da instância do WhatsApp (ex: "Luar Shop")
         """
         self.api_key = api_key
         self.api_url = api_url
+        
+        # CORREÇÃO: Remove qualquer comentário ou espaço extra
+        if instance and '#' in instance:
+            instance = instance.split('#')[0].strip()
+        
         self.instance = instance
-        logger.info(f"Cliente WhatsApp inicializado para instância: {instance}")
+        logger.info(f"Cliente WhatsApp inicializado para instância limpa: '{self.instance}'")
     
     async def send_message(self, text: str, number: str, message_type: MessageType = MessageType.TEXT, 
                          simulate_typing: bool = True, delay: int = 1000, 
@@ -49,6 +54,7 @@ class WhatsAppClient:
             # Para mensagens de texto
             if message_type == MessageType.TEXT:
                 # Endpoint para envio de mensagens de texto
+                # IMPORTANTE: Usa o nome da instância, não o ID
                 endpoint = f"{self.api_url}/message/sendText/{self.instance}"
                 
                 # Determina se é um grupo com base no número/ID
@@ -67,7 +73,6 @@ class WhatsAppClient:
                 
                 logger.info(f"Enviando mensagem para: {number} (Grupo: {is_group})")
                 logger.info(f"Endpoint: {endpoint}")
-                logger.info(f"Payload: {json.dumps(payload, indent=2)}")
                 
                 # Realiza a requisição HTTP
                 async with aiohttp.ClientSession() as session:
@@ -81,15 +86,16 @@ class WhatsAppClient:
                         
                         try:
                             response_data = json.loads(response_text)
-                            logger.info(f"Resposta completa: {json.dumps(response_data, indent=2)}")
+                            
+                            if status_code == 200 or status_code == 201:
+                                logger.info(f"Mensagem enviada com sucesso: {status_code}")
+                                return True
+                            else:
+                                logger.error(f"Erro ao enviar mensagem: {status_code}")
+                                logger.error(f"Resposta: {json.dumps(response_data, indent=2)}")
+                                return False
                         except:
-                            logger.info(f"Resposta (texto): {response_text}")
-                        
-                        if status_code == 200 or status_code == 201:
-                            logger.info(f"Mensagem enviada com sucesso: {status_code}")
-                            return True
-                        else:
-                            logger.error(f"Erro ao enviar mensagem: {status_code}")
+                            logger.error(f"Resposta não-JSON: {response_text}")
                             return False
             else:
                 logger.error(f"Tipo de mensagem não suportado: {message_type}")

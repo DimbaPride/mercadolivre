@@ -9,6 +9,8 @@ from fastapi import FastAPI, Request
 import os
 from stock_agent import StockAgent
 from fastapi import Depends, HTTPException, Header
+from stock_agent import StockAgent
+
 
 # Configuração do sistema de logs
 logging.basicConfig(
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 class BlingConfig:
     """Configuração para API do Bling"""
     api_key: str
-    base_url: str = "https://bling.com.br/Api/v2"
+    base_url: str = "https://bling.com.br/Api/v3"
     
 @dataclass
 class WhatsAppGroup:
@@ -566,7 +568,87 @@ def initialize_monitor(monitor):
     logger.info("Monitor global inicializado com sucesso")
 
 def initialize_stock_agent(agent):
-    """Inicializa o agente de estoque global"""
+    """Inicializa o agente de estoque globalmente"""
     global stock_agent
     stock_agent = agent
-    logger.info("Agente de estoque global inicializado com sucesso")
+    logger.info("Agente de estoque inicializado globalmente")
+
+# bling_stock.py
+# Adicione este endpoint (pode substituir o /whatsapp se quiser)
+@app.post("/webhook")
+async def webhook_handler(request: Request):
+    """
+    Endpoint para receber mensagens do WhatsApp e processá-las com o agente de estoque
+    """
+    try:
+        # Verifica se o agente está inicializado
+        if not stock_agent:
+            logger.error("❌ Agente de estoque não inicializado")
+            return {"status": "error", "message": "Agente de estoque não inicializado"}
+            
+        # Log do webhook recebido
+        data = await request.json()
+        logger.info(f"Webhook recebido: {json.dumps(data, indent=2)}")
+        
+        # O webhook vem no formato Evolution API
+        if "data" not in data:
+            logger.warning("Formato inválido: 'data' não encontrado no webhook")
+            return {"status": "error", "message": "Formato inválido"}
+            
+        webhook_data = data["data"]
+        
+        # Extrai informações da mensagem
+        if not webhook_data.get("message"):
+            logger.warning("Sem mensagem no webhook")
+            return {"status": "success", "message": "Sem mensagem para processar"}
+            
+        # Pega os dados específicos da mensagem
+        message = webhook_data.get("message", {})
+        text = message.get("conversation", "")
+        sender = webhook_data["key"].get("remoteJid", "")
+        participant = webhook_data["key"].get("participant", "")  # Quem enviou em grupo
+        
+        # Se não tem texto, ignora
+        if not text:
+            logger.info("Mensagem sem texto - ignorando")
+            return {"status": "success", "message": "Mensagem sem texto"}
+            
+        # Determina se é mensagem de grupo
+        is_group = "@g.us" in sender
+        logger.info(f"Mensagem recebida - De: {participant if is_group else sender}, Texto: {text}, Grupo: {is_group}")
+        
+        # Para mensagens de grupo, verifica se mencionou o bot
+        if is_group and not any(mention in text.lower() for mention in ["@estoque", "@bot", "@stock"]):
+            logger.info("Mensagem de grupo sem menção ao bot - ignorando")
+            return {"status": "success", "message": "Mensagem ignorada (sem menção ao bot)"}
+        
+        # Processa a mensagem com o agente
+        # Em grupo, usa o participant como sender para identificar quem mandou
+        user_id = participant if is_group else sender
+        response = await stock_agent.process_message(user_id, text)
+        
+        if response:
+            # Envia resposta
+            if bling_monitor and bling_monitor.whatsapp_client:
+                await bling_monitor.whatsapp_client.send_message(
+                    text=response,
+                    number=sender,  # Envia sempre para o grupo/chat
+                    message_type=MessageType.TEXT,
+                    simulate_typing=True if not is_group else False,
+                    delay=1000,
+                    metadata={"isGroup": is_group}
+                )
+                logger.info(f"✅ Resposta enviada para {sender}: {response[:100]}...")
+            else:
+                logger.error("❌ Monitor não inicializado, não é possível enviar resposta")
+                return {"status": "error", "message": "Monitor não inicializado"}
+        else:
+            logger.warning("⚠️ Agente não gerou resposta")
+            
+        return {"status": "success", "message": "Mensagem processada"}
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao processar webhook: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"status": "error", "message": f"Erro interno: {str(e)}"}

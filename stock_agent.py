@@ -6,7 +6,7 @@ import json
 import re
 
 # Importações do Langchain
-from langchain.agents import AgentExecutor, create_structured_chat_agent
+from langchain.agents import AgentExecutor, create_openai_functions_agent
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
@@ -43,19 +43,17 @@ class BlingStockTool:
             "Accept": "application/json"
         }
     
-    async def search_product(self, sku: str) -> Dict:
+    async def search_product(self, sku: str) -> str:
         """
         Busca um produto pelo SKU na API Bling v3
-        
-        :param sku: Código SKU do produto
-        :return: Dados do produto ou None se não encontrado
         """
         try:
-            # Endpoint de consulta de produtos com filtro por código
+            logger.info(f"🔍 Buscando produto com SKU: {sku}")
             url = f"{self.api_url}/produtos"
             params = {"codigo": sku}
             
             async with httpx.AsyncClient() as client:
+                logger.info(f"Fazendo requisição para: {url}")
                 response = await client.get(
                     url, 
                     headers=self.headers,
@@ -63,21 +61,23 @@ class BlingStockTool:
                     timeout=10.0
                 )
                 
+                logger.info(f"Status code: {response.status_code}")
                 if response.status_code == 200:
                     data = response.json()
                     if data.get("data") and len(data["data"]) > 0:
+                        logger.info(f"✅ Produto encontrado: {data['data'][0].get('nome')}")
                         return data["data"][0]
                     else:
-                        logger.warning(f"Produto com SKU {sku} não encontrado")
+                        logger.warning(f"❌ Produto com SKU {sku} não encontrado")
                         return None
                 else:
-                    logger.error(f"Erro ao buscar produto: {response.status_code} - {response.text}")
+                    logger.error(f"❌ Erro ao buscar produto: {response.status_code} - {response.text}")
                     return None
                     
         except Exception as e:
-            logger.error(f"Erro na busca de produto: {str(e)}")
+            logger.error(f"❌ Erro na busca de produto: {str(e)}")
             return None
-    
+        
     async def get_stock(self, product_id: str) -> Dict:
         """
         Obtém o estoque de um produto por ID
@@ -321,160 +321,135 @@ class StockAgent:
         prompt = ChatPromptTemplate.from_messages([
             ("system", """Você é um assistente especializado em gerenciamento de estoque para e-commerce.
 
-    Você tem acesso às seguintes ferramentas:
+    Para consultas de estoque:
+    1. Use o comando "@estoque verificar SKU-123" ou "@bot consultar SKU-123"
+    2. O sistema mostrará nome, preço e estoque atual do produto
 
-    {tools}
+    Para adicionar estoque:
+    1. Use "@estoque adicionar X unidades do SKU-123"
+    2. Especifique o depósito se necessário: "@estoque adicionar X SKU-123 depósito principal"
 
-    Quando receber uma mensagem do usuário:
-    1. Identifique a intenção (consulta, adição, remoção ou transferência de estoque)
-    2. Extraia o SKU do produto mencionado
-    3. Para operações que alteram estoque, confirme com o usuário antes de executar
-    4. Pergunte por informações faltantes (como quantidade ou depósito) se necessário
-    5. Mostre sempre os detalhes do produto antes de realizar operações
+    Para remover estoque:
+    1. Use "@estoque remover X unidades do SKU-123"
+    2. Especifique o depósito se necessário: "@estoque remover X SKU-123 depósito full"
 
-    Para operações de estoque, siga estes passos:
-    1. Primeiro, use search_product para verificar se o produto existe e obter suas informações
-    2. Mostre ao usuário o nome, SKU e estoque atual do produto para confirmação
-    3. Após confirmação, use update_stock para realizar a operação solicitada
-    4. Informe o resultado da operação de forma clara
+    Para transferir estoque:
+    1. Use "@estoque transferir X unidades do SKU-123 do depósito A para B"
 
-    Ferramentas disponíveis: {tool_names}"""),
+    Regras importantes:
+    1. Sempre confirme operações críticas antes de executar
+    2. Mostre o estoque atual antes e depois das operações
+    3. Peça confirmação para alterações de estoque
+    4. Use números inteiros para quantidades
+    5. Sempre responda em português"""),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         
-        # Configura a memória do agente
+        # Configura a memória
         memory = ConversationBufferMemory(
-            return_messages=True,
-            memory_key="chat_history"
+            memory_key="chat_history",
+            return_messages=True
         )
+
+        # Configura o agente usando o novo formato
+        from langchain.agents import create_openai_functions_agent
         
-        # Cria o agente usando o prompt com todas as variáveis necessárias
-        agent = create_structured_chat_agent(
+        agent = create_openai_functions_agent(
             llm=self.llm,
             tools=self.tools,
             prompt=prompt
         )
-        
+
         # Cria o executor do agente
-        return AgentExecutor(
+        agent_executor = AgentExecutor(
             agent=agent,
             tools=self.tools,
             memory=memory,
-            verbose=True,
             handle_parsing_errors=True
         )
-        
+
         return agent_executor
-    
+
     async def process_message(self, user_id: str, message: str) -> str:
         """
         Processa uma mensagem recebida de um usuário
-        
-        :param user_id: Identificador único do usuário
-        :param message: Texto da mensagem
-        :return: Resposta a ser enviada ao usuário
         """
         try:
-            # Verifica se o usuário está em um fluxo de confirmação
-            if user_id in self.conversation_state:
-                state = self.conversation_state[user_id]
-                
-                # Se estiver aguardando confirmação
-                if state.get("awaiting_confirmation"):
-                    # Verifica se a resposta é uma confirmação
-                    if re.search(r'(sim|yes|confirmo|s|y|ok|pode|claro)', message.lower()):
-                        # Remove o estado de confirmação
-                        operation = state.get("operation")
-                        sku = state.get("sku")
-                        quantity = state.get("quantity")
-                        warehouse = state.get("warehouse")
-                        target_warehouse = state.get("target_warehouse")
-                        
-                        # Executa a operação confirmada
-                        result = None
-                        
-                        if operation and sku and quantity:
-                            # Chama a ferramenta de atualização de estoque
-                            input_str = f"Execute a operação confirmada: {operation} {quantity} unidades do produto {sku}"
-                            if warehouse:
-                                input_str += f" no depósito {warehouse}"
-                            if target_warehouse:
-                                input_str += f" para o depósito {target_warehouse}"
-                                
-                            # Limpa o estado da conversa
-                            del self.conversation_state[user_id]
-                            
-                            # Executa o agente
-                            result = await self.agent_executor.ainvoke({"input": input_str})
-                            return result["output"]
-                        else:
-                            del self.conversation_state[user_id]
-                            return "Desculpe, não tenho todas as informações necessárias para completar a operação. Vamos começar de novo."
-                    else:
-                        # Cancelamento
-                        del self.conversation_state[user_id]
-                        return "Operação cancelada. Como posso ajudá-lo agora?"
-            
-            # Detecta se é uma operação que precisa de confirmação
-            operation_match = re.search(r'(adicionar|remover|transferir|add|remove)', message.lower())
-            sku_match = re.search(r'[a-zA-Z0-9]{3,}[-]?[a-zA-Z0-9]{1,}', message.lower())
-            
-            if operation_match and sku_match:
-                # Executa o agente normalmente para obter informações do produto
-                result = await self.agent_executor.ainvoke({"input": message})
-                response = result["output"]
-                
-                # Extrai dados relevantes para confirmação
-                operation = operation_match.group(1)
-                sku = sku_match.group(0)
-                
-                # Extrai quantidade mencionada na mensagem
-                quantity_match = re.search(r'(\d+)\s*(unidades|peças|itens|und|pcs)?', message.lower())
-                quantity = float(quantity_match.group(1)) if quantity_match else None
-                
-                # Extrai depósito mencionado (se houver)
-                warehouse = None
-                if "depósito" in message.lower() or "deposito" in message.lower():
-                    warehouse_match = re.search(r'dep[óo]sito\s+([a-zA-Z0-9\s]+)', message.lower())
-                    if warehouse_match:
-                        warehouse = warehouse_match.group(1).strip()
-                
-                # Extrai depósito de destino para transferências
-                target_warehouse = None
-                if operation == "transferir" and "para" in message.lower():
-                    target_match = re.search(r'para\s+([a-zA-Z0-9\s]+)', message.lower())
-                    if target_match:
-                        target_warehouse = target_match.group(1).strip()
-                
-                # Armazena estado para confirmação
-                if operation != "verificar" and not "confirmado" in message.lower():
-                    self.conversation_state[user_id] = {
-                        "awaiting_confirmation": True,
-                        "operation": operation,
-                        "sku": sku,
-                        "quantity": quantity,
-                        "warehouse": warehouse,
-                        "target_warehouse": target_warehouse,
-                        "timestamp": datetime.now()
-                    }
+            # Se perguntou sobre comandos disponíveis
+            if any(cmd in message.lower() for cmd in ["comandos", "ajuda", "help"]):
+                return """🤖 *Comandos Disponíveis*
+                    1️⃣ *Consultar Estoque*
+    • `@estoque verificar SKU-123`
+    • `@bot consultar SKU-123`
+
+    2️⃣ *Adicionar Estoque*
+    • `@estoque adicionar 10 unidades do SKU-123`
+    • `@estoque add 5 SKU-456 depósito principal`
+
+    3️⃣ *Remover Estoque*
+    • `@estoque remover 3 unidades do SKU-789`
+    • `@estoque remove 2 SKU-123 depósito full`
+
+    4️⃣ *Transferir Estoque*
+    • `@estoque transferir 5 SKU-123 do principal para full`
+
+    📝 *Observações*:
+    • Use sempre o SKU correto do produto
+    • Especifique a quantidade claramente
+    • Mencione o depósito quando necessário
+    • Aguarde confirmação em operações críticas
+
+    ❓ Para mais ajuda, use:
+    `@bot ajuda [comando]`
+    Exemplo: `@bot ajuda transferir`"""
+
+            # Extrai o SKU da mensagem para consulta de estoque
+            if "@estoque verificar" in message or "@bot consultar" in message:
+                sku_match = re.search(r'(?:verificar|consultar)\s+(\w+)', message)
+                if sku_match:
+                    sku = sku_match.group(1)
+                    # Usa diretamente a ferramenta de busca
+                    result = await self.tools[0].run({"sku": sku})
                     
-                    # Adiciona pergunta de confirmação na resposta
-                    if not "?" in response:
-                        response += "\n\nVocê confirma esta operação? Responda 'sim' para prosseguir ou 'não' para cancelar."
-                
-                return response
-                
-            else:
-                # Processamento normal para consultas
-                result = await self.agent_executor.ainvoke({"input": message})
-                return result["output"]
-                
+                    # Processa o resultado
+                    try:
+                        data = json.loads(result)
+                        if data.get("found"):
+                            product = data["product"]
+                            stocks = data.get("stock", [])
+                            
+                            response = f"📦 *Produto: {product['name']}*\n"
+                            response += f"SKU: `{product['sku']}`\n"
+                            response += f"Preço: R$ {product['price']}\n\n"
+                            response += "*Estoque por Depósito:*\n"
+                            
+                            for stock in stocks:
+                                response += f"- {stock['warehouse_name']}: {stock['quantity']} unidades\n"
+                                
+                            return response
+                        else:
+                            return f"❌ Produto com SKU {sku} não encontrado."
+                    except json.JSONDecodeError:
+                        return "❌ Erro ao processar informações do produto."
+                else:
+                    return "❌ Por favor, especifique o SKU do produto.\nExemplo: `@estoque verificar SKU123`"
+
+            # Para outros comandos, usa o agente
+            result = await self.agent_executor.ainvoke(
+                {
+                    "input": message
+                }
+            )
+            
+            return result.get("output", "Desculpe, não consegui processar sua solicitação.")
+            
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
-            return f"Desculpe, ocorreu um erro ao processar sua solicitação: {str(e)}"
-    
+            import traceback
+            logger.error(traceback.format_exc())
+            return "❌ Desculpe, ocorreu um erro ao processar sua solicitação. Por favor, tente novamente."
     def cleanup_expired_states(self, timeout_minutes: int = 15):
         """
         Limpa estados de conversação expirados
