@@ -12,8 +12,7 @@ from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
 from langchain.tools import StructuredTool
 from pydantic import BaseModel, Field
-from langchain.callbacks.manager import CallbackManagerForToolRun
-from langchain.schema import SystemMessage
+
 
 
 
@@ -42,10 +41,17 @@ class BlingStockTool:
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-    
-    async def search_product(self, sku: str) -> str:
+        self.depositos_map = {
+            1511573259: "Depósito Principal",
+            13801775465: "Depósito Full"
+        }  # Mapeamento de ID para nome de depósito   
+            
+    async def fetch_product_from_api(self, sku: str) -> dict:
         """
-        Busca um produto pelo SKU na API Bling v3
+        Busca um produto pelo SKU diretamente da API Bling v3
+        
+        :param sku: SKU do produto a ser buscado
+        :return: Dados do produto ou None se não encontrado
         """
         try:
             logger.info(f"🔍 Buscando produto com SKU: {sku}")
@@ -62,11 +68,15 @@ class BlingStockTool:
                 )
                 
                 logger.info(f"Status code: {response.status_code}")
+                
+                # Log da resposta completa para depuração
                 if response.status_code == 200:
                     data = response.json()
+                    logger.info(f"Estrutura da resposta: {json.dumps(data, indent=2)}")
+                    
                     if data.get("data") and len(data["data"]) > 0:
                         logger.info(f"✅ Produto encontrado: {data['data'][0].get('nome')}")
-                        return data["data"][0]
+                        return data["data"][0]  # Retorna o primeiro produto encontrado
                     else:
                         logger.warning(f"❌ Produto com SKU {sku} não encontrado")
                         return None
@@ -76,27 +86,97 @@ class BlingStockTool:
                     
         except Exception as e:
             logger.error(f"❌ Erro na busca de produto: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None
-        
-    async def get_stock(self, product_id: str) -> Dict:
+
+    async def fetch_product_from_api_by_id(self, product_id: str) -> dict:
         """
-        Obtém o estoque de um produto por ID
+        Busca um produto pelo ID diretamente da API Bling v3
         
-        :param product_id: ID interno do produto no Bling
-        :return: Dados de estoque do produto
+        :param product_id: ID do produto a ser buscado
+        :return: Dados do produto ou None se não encontrado
         """
         try:
-            url = f"{self.api_url}/estoques/produtos/{product_id}"
+            logger.info(f"Buscando produto com ID: {product_id}")
+            url = f"{self.api_url}/produtos/{product_id}"
             
             async with httpx.AsyncClient() as client:
                 response = await client.get(
-                    url,
+                    url, 
                     headers=self.headers,
                     timeout=10.0
                 )
                 
                 if response.status_code == 200:
-                    return response.json()
+                    data = response.json()
+                    return data.get("data")
+                else:
+                    logger.error(f"Erro ao buscar produto por ID: {response.status_code} - {response.text}")
+                    return None
+        except Exception as e:
+            logger.error(f"Erro na busca de produto por ID: {str(e)}")
+            return None            
+
+    async def fetch_product_variations(self, parent_id: str) -> list:
+        """
+        Busca todas as variações de um produto pai
+        
+        :param parent_id: ID do produto pai
+        :return: Lista de variações
+        """
+        try:
+            logger.info(f"Buscando variações do produto com idProdutoPai: {parent_id}")
+            url = f"{self.api_url}/produtos"
+            params = {"idProdutoPai": parent_id}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    url, 
+                    headers=self.headers,
+                    params=params,
+                    timeout=10.0
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    variations = data.get("data", [])
+                    logger.info(f"Encontradas {len(variations)} variações para o produto pai ID {parent_id}")
+                    return variations
+                else:
+                    logger.error(f"Erro ao buscar variações: {response.status_code} - {response.text}")
+                    return []
+        except Exception as e:
+            logger.error(f"Erro ao buscar variações: {str(e)}")
+            return []
+            
+    async def fetch_stock_from_api(self, product_id: str) -> dict:
+        """
+        Obtém o estoque de um produto por ID direto da API Bling
+        
+        :param product_id: ID interno do produto no Bling
+        :return: Dados de estoque do produto
+        """
+        try:
+            # Endpoint correto conforme documentação Bling v3
+            url = f"{self.api_url}/estoques/saldos"
+            params = {"idsProdutos[]": product_id}
+            
+            async with httpx.AsyncClient() as client:
+                logger.info(f"Consultando estoque para produto ID {product_id}")
+                response = await client.get(
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=10.0
+                )
+                
+                logger.info(f"Status code estoque: {response.status_code}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    logger.info(f"Dados de estoque recebidos: {json.dumps(data, indent=2)}")
+                    return data
                 else:
                     logger.error(f"Erro ao obter estoque: {response.status_code} - {response.text}")
                     return None
@@ -104,10 +184,10 @@ class BlingStockTool:
         except Exception as e:
             logger.error(f"Erro na consulta de estoque: {str(e)}")
             return None
-    
-    async def update_stock(self, product_id: str, warehouse_id: str, operation: str, quantity: float) -> Dict:
+            
+    async def update_stock_in_api(self, product_id: str, warehouse_id: str, operation: str, quantity: float) -> dict:
         """
-        Atualiza o estoque de um produto
+        Atualiza o estoque de um produto na API do Bling
         
         :param product_id: ID interno do produto no Bling
         :param warehouse_id: ID do depósito
@@ -145,9 +225,9 @@ class BlingStockTool:
             logger.error(f"Erro na atualização de estoque: {str(e)}")
             return {"success": False, "message": f"Erro: {str(e)}"}
     
-    async def get_warehouses(self) -> List[Dict]:
+    async def fetch_warehouses_from_api(self) -> list:
         """
-        Obtém a lista de depósitos disponíveis
+        Obtém a lista de depósitos disponíveis da API do Bling
         
         :return: Lista de depósitos
         """
@@ -163,6 +243,7 @@ class BlingStockTool:
                 
                 if response.status_code == 200:
                     data = response.json()
+                    logger.info(f"Dados de depósitos recebidos: {len(data.get('data', []))} depósitos")
                     return data.get("data", [])
                 else:
                     logger.error(f"Erro ao obter depósitos: {response.status_code} - {response.text}")
@@ -227,62 +308,193 @@ class StockAgent:
         self.conversation_state = {}
         
     def _setup_tools(self):
-        """Configura as ferramentas do agente"""
+        """Configura as ferramentas do agente com nomes descritivos"""
         
         # Ferramenta para buscar produto
-        async def search_product(sku: str) -> str:
-            """
-            Busca um produto pelo SKU
+        async def tool_search_product(sku: str) -> str:
+            """Ferramenta para buscar um produto pelo SKU"""
+            # Definir manualmente os depósitos conhecidos
+            depots_map = self.bling_tool.depositos_map
+
+
+            # Buscar o produto pelo SKU
+            product_data = await self.bling_tool.fetch_product_from_api(sku)
             
-            Args:
-                sku: Código SKU do produto
-                
-            Returns:
-                String com informações do produto no formato JSON
-            """
-            result = await self.bling_tool.search_product(sku)
-            if not result:
+            if not product_data:
                 return json.dumps({
                     "found": False, 
                     "message": f"Produto com SKU {sku} não encontrado"
                 })
             
-            # Busca informações de estoque
-            product_id = result.get("id")
-            stock_info = await self.bling_tool.get_stock(product_id)
+            # Verificar se é um produto pai ou filho
+            product_id = product_data.get("id")
+            is_parent = "idProdutoPai" not in product_data or product_data.get("idProdutoPai") is None
+            parent_id = None if is_parent else product_data.get("idProdutoPai")
             
-            # Combina informações do produto com estoque
-            combined_info = {
+            # Inicializar o objeto de resposta
+            result = {
                 "found": True,
+                "is_parent": is_parent,
                 "product": {
-                    "id": result.get("id"),
-                    "name": result.get("nome"),
-                    "sku": result.get("codigo"),
-                    "price": result.get("preco"),
-                }
+                    "id": product_data.get("id"),
+                    "name": product_data.get("nome"),
+                    "sku": product_data.get("codigo")
+                    # Removido preço conforme solicitado
+                },
+                "stock": []
             }
             
-            if stock_info and "data" in stock_info:
-                combined_info["stock"] = [
-                    {
-                        "warehouse_id": stock.get("deposito", {}).get("id"),
-                        "warehouse_name": stock.get("deposito", {}).get("nome"),
-                        "quantity": stock.get("quantidade")
-                    }
-                    for stock in stock_info.get("data", [])
-                ]
+            # Buscar informações de estoque do produto atual
+            stock_info = await self.bling_tool.fetch_stock_from_api(product_id)
             
-            return json.dumps(combined_info)
-        
+            # Processar estoque do produto atual
+            if stock_info and "data" in stock_info:
+                for stock_item in stock_info.get("data", []):
+                    if str(stock_item.get("produto", {}).get("id")) == str(product_id):
+                        result["product"]["total_stock"] = stock_item.get("saldoVirtualTotal", 0)
+                        
+                        for deposito in stock_item.get("depositos", []):
+                            deposito_id = deposito.get("id")
+                            deposito_nome = depots_map.get(deposito_id, f"Depósito {deposito_id}")
+                            
+                            result["stock"].append({
+                                "warehouse_id": deposito_id,
+                                "warehouse_name": deposito_nome,
+                                "quantity": deposito.get("saldoVirtual", 0)
+                            })
+            
+            # Se é um produto pai, buscar suas variações
+            if is_parent:
+                parent_name = product_data.get("nome", "")
+                logger.info(f"Buscando variações para o produto pai: {parent_name}")
+                
+                # Primeira tentativa: obter o produto pai detalhado que pode conter variações
+                url = f"{self.bling_tool.api_url}/produtos/{product_id}"
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        url,
+                        headers=self.bling_tool.headers,
+                        timeout=10.0
+                    )
+                    
+                    variations_data = []
+                    
+                    if response.status_code == 200:
+                        parent_full = response.json().get("data", {})
+                        
+                        # Verificar se o produto pai já tem variações listadas
+                        if "variacoes" in parent_full and parent_full["variacoes"]:
+                            logger.info(f"Encontradas {len(parent_full['variacoes'])} variações no produto pai")
+                            variations_data = parent_full["variacoes"]
+                        else:
+                            # Segunda tentativa: buscar variações e filtrar manualmente
+                            variations_url = f"{self.bling_tool.api_url}/produtos"
+                            params = {
+                                "idProdutoPai": product_id,
+                                "tipo": "V",  # Apenas variações
+                                "limite": 100
+                            }
+                            
+                            variations_response = await client.get(
+                                variations_url,
+                                headers=self.bling_tool.headers,
+                                params=params,
+                                timeout=10.0
+                            )
+                            
+                            if variations_response.status_code == 200:
+                                all_variations = variations_response.json().get("data", [])
+                                logger.info(f"Obtidas {len(all_variations)} variações da API")
+                                
+                                # Filtro manual: variação deve ter o nome do produto pai como prefixo
+                                for var in all_variations:
+                                    var_name = var.get("nome", "")
+                                    # Verifica se é uma variação real comparando nomes
+                                    if var_name.startswith(parent_name):
+                                        variations_data.append(var)
+                                
+                                logger.info(f"Após filtro manual, {len(variations_data)} variações são realmente relacionadas")
+                    
+                    # Processar apenas as variações relacionadas
+                    result["variations"] = []
+                    
+                    for variation in variations_data:
+                        variation_id = variation.get("id")
+                        variation_info = {
+                            "id": variation_id,
+                            "name": variation.get("nome"),
+                            "sku": variation.get("codigo"),
+                            "stock": []
+                        }
+                        
+                        # Buscar estoque da variação
+                        variation_stock = await self.bling_tool.fetch_stock_from_api(variation_id)
+                        
+                        if variation_stock and "data" in variation_stock:
+                            for stock_item in variation_stock.get("data", []):
+                                if str(stock_item.get("produto", {}).get("id")) == str(variation_id):
+                                    for deposito in stock_item.get("depositos", []):
+                                        deposito_id = deposito.get("id")
+                                        deposito_nome = depots_map.get(deposito_id, f"Depósito {deposito_id}")
+                                        
+                                        variation_info["stock"].append({
+                                            "warehouse_id": deposito_id,
+                                            "warehouse_name": deposito_nome,
+                                            "quantity": deposito.get("saldoVirtual", 0)
+                                        })
+                        
+                        result["variations"].append(variation_info)
+            
+            # Se é um produto filho, buscar apenas informações do pai            
+            elif parent_id:
+                url = f"{self.bling_tool.api_url}/produtos/{parent_id}"
+                
+                logger.info(f"Buscando produto pai completo com ID: {parent_id}")
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        url,
+                        headers=self.bling_tool.headers,
+                        timeout=10.0
+                    )
+                    
+                    if response.status_code == 200:
+                        parent_data = response.json().get("data")
+                        
+                        if parent_data:
+                            # Informações do pai
+                            result["parent"] = {
+                                "id": parent_data.get("id"),
+                                "name": parent_data.get("nome"),
+                                "sku": parent_data.get("codigo")
+                            }
+                            
+                            # Variações já vêm na resposta!
+                            if "variacoes" in parent_data and parent_data["variacoes"]:
+                                result["siblings"] = []
+                                
+                                for sibling in parent_data["variacoes"]:
+                                    # Não incluir a própria variação
+                                    if str(sibling.get("id")) != str(product_id):
+                                        result["siblings"].append({
+                                            "id": sibling.get("id"),
+                                            "name": sibling.get("nome"),
+                                            "sku": sibling.get("codigo")
+                                        })
+            
+            return json.dumps(result)
+
+        # Cria a ferramenta estruturada com um nome descritivo
         search_tool = StructuredTool.from_function(
-            func=search_product,
-            name="search_product",
+            func=tool_search_product,  # Usa a função com nome descritivo
+            name="search_product",  # Nome da ferramenta para o LLM
             description="Busca um produto pelo SKU (código) para verificar se existe e obter informações como nome, preço e estoque atual",
             args_schema=ProductSearchInput
         )
         
         # Ferramenta para atualizar estoque
-        async def update_stock(
+        async def tool_update_stock(
             sku: str,
             quantity: float,
             operation: str,
@@ -290,7 +502,7 @@ class StockAgent:
             target_warehouse: str = None
         ) -> str:
             """
-            Atualiza o estoque de um produto
+            Ferramenta para atualizar o estoque de um produto
             
             Args:
                 sku: Código SKU do produto
@@ -302,12 +514,137 @@ class StockAgent:
             Returns:
                 String com resultado da operação
             """
-            # Implementação existente...
-            pass  # Mantenha sua implementação atual
+            # Implementação da atualização de estoque...
+            try:
+                # Primeiro, busca o produto
+                product_data = await self.bling_tool.fetch_product_from_api(sku)
+                
+                if not product_data:
+                    return json.dumps({
+                        "success": False,
+                        "message": f"Produto com SKU {sku} não encontrado"
+                    })
+                
+                # Obter ID do produto
+                product_id = product_data.get("id")
+                product_name = product_data.get("nome")
+                
+                # Buscar depósitos
+                warehouses = await self.bling_tool.fetch_warehouses_from_api()
+                
+                # Mapear IDs dos depósitos
+                warehouse_id = None
+                target_warehouse_id = None
+                
+                # Encontrar ID do depósito de origem
+                if warehouse:
+                    for w in warehouses:
+                        if warehouse.lower() in w.get("nome", "").lower():
+                            warehouse_id = w.get("id")
+                            break
+                elif warehouses:
+                    # Se não especificou depósito, usa o primeiro da lista
+                    warehouse_id = warehouses[0].get("id")
+                
+                # Encontrar ID do depósito de destino para transferências
+                if operation == "transferir" and target_warehouse:
+                    for w in warehouses:
+                        if target_warehouse.lower() in w.get("nome", "").lower():
+                            target_warehouse_id = w.get("id")
+                            break
+                
+                # Verificar se encontrou os depósitos
+                if not warehouse_id:
+                    return json.dumps({
+                        "success": False,
+                        "message": "Depósito de origem não encontrado"
+                    })
+                
+                if operation == "transferir" and not target_warehouse_id:
+                    return json.dumps({
+                        "success": False,
+                        "message": "Depósito de destino não encontrado"
+                    })
+                
+                # Executar a operação
+                result = None
+                
+                if operation == "adicionar":
+                    # Adicionar estoque (Entrada)
+                    result = await self.bling_tool.update_stock_in_api(
+                        product_id=product_id,
+                        warehouse_id=warehouse_id,
+                        operation="E",  # E = Entrada
+                        quantity=abs(quantity)  # Garante que seja positivo
+                    )
+                    
+                elif operation == "remover":
+                    # Remover estoque (Saída)
+                    result = await self.bling_tool.update_stock_in_api(
+                        product_id=product_id,
+                        warehouse_id=warehouse_id,
+                        operation="S",  # S = Saída
+                        quantity=abs(quantity)  # Garante que seja positivo
+                    )
+                    
+                elif operation == "transferir":
+                    # Transferir = Saída de um depósito + Entrada em outro
+                    # 1. Saída do primeiro depósito
+                    result_saida = await self.bling_tool.update_stock_in_api(
+                        product_id=product_id,
+                        warehouse_id=warehouse_id,
+                        operation="S",
+                        quantity=abs(quantity)
+                    )
+                    
+                    # 2. Entrada no segundo depósito
+                    result_entrada = await self.bling_tool.update_stock_in_api(
+                        product_id=product_id,
+                        warehouse_id=target_warehouse_id,
+                        operation="E",
+                        quantity=abs(quantity)
+                    )
+                    
+                    # Combina os resultados
+                    if result_saida.get("success", False) and result_entrada.get("success", False):
+                        result = {
+                            "success": True,
+                            "message": f"Transferência de {quantity} unidades do produto realizada com sucesso"
+                        }
+                    else:
+                        result = {
+                            "success": False,
+                            "message": "Erro na transferência: " + 
+                                      result_saida.get("message", "") + " / " + 
+                                      result_entrada.get("message", "")
+                        }
+                
+                # Formata a resposta
+                return json.dumps({
+                    "success": result.get("success", False),
+                    "message": result.get("message", "Operação concluída"),
+                    "product": {
+                        "id": product_id,
+                        "name": product_name,
+                        "sku": sku
+                    },
+                    "operation": operation,
+                    "quantity": quantity
+                })
+                
+            except Exception as e:
+                logger.error(f"Erro ao atualizar estoque: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return json.dumps({
+                    "success": False,
+                    "message": f"Erro ao processar operação: {str(e)}"
+                })
         
+        # Cria a ferramenta estruturada
         update_tool = StructuredTool.from_function(
-            func=update_stock,
-            name="update_stock",
+            func=tool_update_stock,  # Usa a função com nome descritivo
+            name="update_stock",  # Nome da ferramenta para o LLM
             description="Atualiza o estoque de um produto, podendo adicionar, remover ou transferir unidades entre depósitos",
             args_schema=StockUpdateInput
         )
@@ -407,42 +744,80 @@ class StockAgent:
 
             # Extrai o SKU da mensagem para consulta de estoque
             if "@estoque verificar" in message or "@bot consultar" in message:
-                sku_match = re.search(r'(?:verificar|consultar)\s+(\w+)', message)
+                sku_match = re.search(r'(?:verificar|consultar)\s+([\w\-\.]+)', message)
                 if sku_match:
                     sku = sku_match.group(1)
-                    # Usa diretamente a ferramenta de busca
-                    result = await self.tools[0].run({"sku": sku})
+                    logger.info(f"Consultando SKU: {sku}")
                     
-                    # Processa o resultado
-                    try:
+                    # Usa diretamente a ferramenta de busca
+                    search_tool = self.tools[0]  # Ferramenta de busca é a primeira na lista
+                    result = await search_tool.run({"sku": sku})
+                    logger.info(f"Resultado da busca recebido, tamanho: {len(result)} caracteres")
+                    
+                   # Processa o resultado
+                    try:                        
                         data = json.loads(result)
                         if data.get("found"):
                             product = data["product"]
                             stocks = data.get("stock", [])
                             
                             response = f"📦 *Produto: {product['name']}*\n"
-                            response += f"SKU: `{product['sku']}`\n"
-                            response += f"Preço: R$ {product['price']}\n\n"
+                            response += f"SKU: `{product['sku']}`\n\n"
+                            
+                            # Mostrar estoque do produto atual
                             response += "*Estoque por Depósito:*\n"
                             
-                            for stock in stocks:
-                                response += f"- {stock['warehouse_name']}: {stock['quantity']} unidades\n"
+                            if stocks:
+                                for stock in stocks:
+                                    warehouse_name = stock.get('warehouse_name', 'Depósito')
+                                    quantity = stock.get('quantity', 0)
+                                    response += f"- {warehouse_name}: {quantity} unidades\n"
+                            else:
+                                response += "- Nenhum estoque encontrado para este produto\n"
+                            
+                            # Mostrar informações do pai se for variação
+                            if "parent" in data and data["parent"]:
+                                parent = data["parent"]
+                                response += f"\n*Produto Pai:* {parent['name']}\n"
+                                response += f"SKU do Pai: `{parent['sku']}`\n"
+                            
+                            # Mostrar variações se for produto pai
+                            if "variations" in data and data["variations"]:
+                                response += "\n*Variações deste produto:*\n"
                                 
+                                for i, variation in enumerate(data["variations"], 1):
+                                    response += f"{i}. *{variation['name']}*\n"
+                                    response += f"   SKU: `{variation['sku']}`\n"
+                                    
+                                    # Mostrar estoque de cada variação
+                                    if "stock" in variation and variation["stock"]:
+                                        for stock in variation["stock"]:
+                                            warehouse_name = stock.get('warehouse_name', 'Depósito')
+                                            quantity = stock.get('quantity', 0)
+                                            response += f"   - {warehouse_name}: {quantity} unidades\n"
+                                    else:
+                                        response += "   - Sem estoque disponível\n"
+                            
+                            # IMPORTANTE: este return deve estar FORA dos if/else aninhados
                             return response
                         else:
                             return f"❌ Produto com SKU {sku} não encontrado."
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Erro ao decodificar JSON: {e}")
+                        logger.error(f"Conteúdo recebido: {result}")
                         return "❌ Erro ao processar informações do produto."
                 else:
                     return "❌ Por favor, especifique o SKU do produto.\nExemplo: `@estoque verificar SKU123`"
 
             # Para outros comandos, usa o agente
+            logger.info(f"Processando mensagem complexa: {message}")
             result = await self.agent_executor.ainvoke(
                 {
                     "input": message
                 }
             )
             
+            logger.info(f"Resposta do agente recebida: {len(result.get('output', ''))} caracteres")
             return result.get("output", "Desculpe, não consegui processar sua solicitação.")
             
         except Exception as e:
@@ -450,6 +825,7 @@ class StockAgent:
             import traceback
             logger.error(traceback.format_exc())
             return "❌ Desculpe, ocorreu um erro ao processar sua solicitação. Por favor, tente novamente."
+            
     def cleanup_expired_states(self, timeout_minutes: int = 15):
         """
         Limpa estados de conversação expirados
@@ -469,13 +845,4 @@ class StockAgent:
         
         if expired_users:
             logger.info(f"Limpados {len(expired_users)} estados de conversação expirados")
-
-
-# Exemplo de como inicializar e usar o agente
-if __name__ == "__main__":
-    # Carrega variáveis de ambiente
-    groq_api_key = os.environ.get("GROQ_API_KEY")
-    bling_api_key = os.environ.get("BLING_API_KEY")
     
-    # Inicializa o agente
-    agent = StockAgent(groq_api_key=groq_api_key, bling_api_key=bling_api_key)

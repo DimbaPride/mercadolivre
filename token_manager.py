@@ -337,7 +337,7 @@ class BlingTokenManager:
         payload = {
             "grant_type": "authorization_code",
             "code": auth_code,
-            "redirect_uri": "https://530f-45-171-45-13.ngrok-free.app/callback"  # Use a URL de callback do seu app
+            "redirect_uri": "https://c8cf-45-171-45-13.ngrok-free.app/callback"  # Use a URL de callback do seu app
         }
         
         # Autenticação HTTP Basic

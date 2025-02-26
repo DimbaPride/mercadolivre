@@ -1,0 +1,60 @@
+[33mcommit 1709ca6f15c97d24ecfc190525b9377414130ee7[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m)[m
+Author: DimbaPride <caiocbergamasco@gmail.com>
+Date:   Tue Feb 25 11:00:48 2025 -0300
+
+    fix: correção de problemas de autenticação e comunicação com WhatsApp
+    
+    Este commit inclui várias correções críticas que resolvem problemas com tokens expirados
+    e falhas na comunicação com a Evolution API do WhatsApp:
+    
+    1. Correção do gerenciador de token (token_manager.py):
+       - Implementado rastreamento correto de expiração de token OAuth
+       - Adicionado campo created_at para calcular tempo restante do token
+       - Melhorada lógica de renovação proativa
+       - Reduzido intervalo de verificação para 1 hora
+    
+    2. Correção do cliente WhatsApp (whatsapp_client.py):
+       - Corrigido problema com comentários no nome da instância
+       - Implementada limpeza de string para remover comentários e espaços extras
+       - Garantido uso do nome da instância (não o ID) nas chamadas de API
+    
+    3. Atualização no arquivo de configuração (config.py):
+       - Ajustado para usar o nome da instância de forma consistente
+       - Removidas referências desnecessárias ao ID da instância
+    
+    4. Atualização do arquivo principal (main.py):
+       - Corrigida a inicialização do monitor para usar os parâmetros corretos
+       - Melhorada a inicialização do agente de estoque
+    
+    A causa raiz dos problemas era uma combinação de erro na verificação de expiração de
+    token OAuth e o uso incorreto do nome da instância do WhatsApp com comentários.
+
+[33mcommit bd691789003060c59c9d3bc8bee25e83f0dfc24f[m
+Author: DimbaPride <caiocbergamasco@gmail.com>
+Date:   Mon Feb 24 21:50:28 2025 -0300
+
+    Implementação de Gestão de estoque e consulta pelo whatsapp
+
+[33mcommit a8ccdc84b9a3fe3262700d5bfb9a17e53ac8a50c[m
+Author: DimbaPride <caiocbergamasco@gmail.com>
+Date:   Mon Feb 24 20:42:46 2025 -0300
+
+    Aprimoramento do monitor de estoque: melhorias na detecção de variações, formatação aprimorada das mensagens e correção da lógica para ignorar produtos pai com variações em estoque
+
+[33mcommit cff62d53fe5d029b3d285211d8c3802ff366abb8[m
+Author: DimbaPride <caiocbergamasco@gmail.com>
+Date:   Mon Feb 24 17:04:16 2025 -0300
+
+    Aprimoramento do monitor de estoque: melhorias na detecção de variações, formatação aprimorada das mensagens e correção da lógica para ignorar produtos pai com variações em estoque
+
+[33mcommit bc721aacbfd261df9d3c8bcb68bf516575a0ecd1[m
+Author: DimbaPride <caiocbergamasco@gmail.com>
+Date:   Mon Feb 24 09:47:27 2025 -0300
+
+    Corrige nomes de arquivos e adiciona arquivos faltantes
+
+[33mcommit fa9a007c77b842728abf4c67225f149de78e43ba[m
+Author: DimbaPride <caiocbergamasco@gmail.com>
+Date:   Mon Feb 24 09:42:08 2025 -0300
+
+    Initial commit: Estrutura básica do projeto
