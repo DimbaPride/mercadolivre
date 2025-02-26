@@ -6,7 +6,10 @@ import json
 import re
 
 # Importações do Langchain
-from langchain.agents import AgentExecutor, create_openai_functions_agent
+from langchain.agents import AgentExecutor, create_structured_chat_agent
+from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
+from langchain.agents.format_scratchpad import format_to_openai_functions
+
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
@@ -54,36 +57,42 @@ class BlingStockTool:
         :return: Dados do produto ou None se não encontrado
         """
         try:
-            logger.info(f"🔍 Buscando produto com SKU: {sku}")
-            url = f"{self.api_url}/produtos"
-            params = {"codigo": sku}
+            # Lista de formatos para tentar (original, maiúsculo, minúsculo)
+            sku_variants = [
+                sku.strip(),                     # Original sem espaços
+                sku.strip().upper(),             # Tudo maiúsculo
+                sku.strip().lower(),             # Tudo minúsculo
+            ]
             
-            async with httpx.AsyncClient() as client:
-                logger.info(f"Fazendo requisição para: {url}")
-                response = await client.get(
-                    url, 
-                    headers=self.headers,
-                    params=params,
-                    timeout=10.0
-                )
+            logger.info(f"Tentando variantes do SKU: {sku_variants}")
+            
+            # Tenta cada variante até encontrar um resultado
+            for variant in sku_variants:
+                url = f"{self.api_url}/produtos"
+                params = {"codigo": variant}
                 
-                logger.info(f"Status code: {response.status_code}")
-                
-                # Log da resposta completa para depuração
-                if response.status_code == 200:
-                    data = response.json()
-                    logger.info(f"Estrutura da resposta: {json.dumps(data, indent=2)}")
+                async with httpx.AsyncClient() as client:
+                    logger.info(f"Fazendo requisição para: {url} com SKU: {variant}")
+                    response = await client.get(
+                        url, 
+                        headers=self.headers,
+                        params=params,
+                        timeout=10.0
+                    )
                     
-                    if data.get("data") and len(data["data"]) > 0:
-                        logger.info(f"✅ Produto encontrado: {data['data'][0].get('nome')}")
-                        return data["data"][0]  # Retorna o primeiro produto encontrado
-                    else:
-                        logger.warning(f"❌ Produto com SKU {sku} não encontrado")
-                        return None
-                else:
-                    logger.error(f"❌ Erro ao buscar produto: {response.status_code} - {response.text}")
-                    return None
+                    logger.info(f"Status code para variante {variant}: {response.status_code}")
                     
+                    if response.status_code == 200:
+                        data = response.json()
+                        
+                        if data.get("data") and len(data["data"]) > 0:
+                            logger.info(f"✅ Produto encontrado com variante {variant}: {data['data'][0].get('nome')}")
+                            return data["data"][0]  # Retorna o primeiro produto encontrado
+            
+            # Se chegou aqui, não encontrou em nenhuma variante
+            logger.warning(f"❌ Produto com SKU {sku} não encontrado em nenhuma variante")
+            return None
+                        
         except Exception as e:
             logger.error(f"❌ Erro na busca de produto: {str(e)}")
             import traceback
@@ -185,25 +194,36 @@ class BlingStockTool:
             logger.error(f"Erro na consulta de estoque: {str(e)}")
             return None
             
+    
     async def update_stock_in_api(self, product_id: str, warehouse_id: str, operation: str, quantity: float) -> dict:
         """
         Atualiza o estoque de um produto na API do Bling
         
         :param product_id: ID interno do produto no Bling
         :param warehouse_id: ID do depósito
-        :param operation: Tipo de operação (E para entrada, S para saída)
-        :param quantity: Quantidade a ser adicionada ou removida
+        :param operation: Tipo de operação (E para entrada, S para saída, B para balanço)
+        :param quantity: Quantidade a ser adicionada, removida ou definida (no caso de balanço)
         :return: Resultado da operação
         """
         try:
-            url = f"{self.api_url}/estoques/produtos/{product_id}/depositos/{warehouse_id}"
+            # URL do endpoint de estoques
+            url = f"{self.api_url}/estoques"
             
+            # Construir payload sem modificar a operação recebida
             payload = {
-                "operacao": operation,  # "E" para entrada, "S" para saída
-                "quantidade": quantity,
+                "produto": {
+                    "id": int(product_id)
+                },
+                "deposito": {
+                    "id": int(warehouse_id)
+                },
+                "operacao": operation,  # Usar exatamente o valor recebido (E, S ou B)
+                "quantidade": float(quantity),
                 "observacoes": f"Operação via Assistente de Estoque em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
             }
             
+            logger.info(f"Enviando payload para atualização de estoque: {json.dumps(payload, indent=2)}")
+                        
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     url,
@@ -212,11 +232,10 @@ class BlingStockTool:
                     timeout=10.0
                 )
                 
+                logger.info(f"Status code da atualização: {response.status_code}")
+                
                 if response.status_code in (200, 201, 204):
-                    # Alguns endpoints retornam 204 No Content
-                    if response.status_code == 204:
-                        return {"success": True, "message": "Estoque atualizado com sucesso"}
-                    return response.json()
+                    return {"success": True, "message": "Estoque atualizado com sucesso"}
                 else:
                     logger.error(f"Erro ao atualizar estoque: {response.status_code} - {response.text}")
                     return {"success": False, "message": f"Erro: {response.text}"}
@@ -532,25 +551,46 @@ class StockAgent:
                 # Buscar depósitos
                 warehouses = await self.bling_tool.fetch_warehouses_from_api()
                 
-                # Mapear IDs dos depósitos
+                # Usar o mapeamento existente para preencher os nomes dos depósitos
+                warehouses_with_names = []
+                for w in warehouses:
+                    depot_id = w.get("id")
+                    # Usar o mapeamento conhecido ao invés dos nomes vazios da API
+                    nome = self.bling_tool.depositos_map.get(depot_id, "Depósito Desconhecido")
+                    warehouses_with_names.append({"id": depot_id, "nome": nome.lower()})
+
+                logger.info(f"Depósitos disponíveis: {warehouses_with_names}")
+
+                # Código para encontrar o depósito de origem:
                 warehouse_id = None
-                target_warehouse_id = None
-                
-                # Encontrar ID do depósito de origem
                 if warehouse:
-                    for w in warehouses:
-                        if warehouse.lower() in w.get("nome", "").lower():
+                    warehouse_lower = warehouse.lower()
+                    for w in warehouses_with_names:
+                        nome_deposito = w.get("nome", "").lower()
+                        
+                        if "principal" in nome_deposito and ("principal" in warehouse_lower or "padrão" in warehouse_lower):
                             warehouse_id = w.get("id")
+                            logger.info(f"Depósito PRINCIPAL encontrado: {nome_deposito} (ID: {warehouse_id})")
                             break
-                elif warehouses:
-                    # Se não especificou depósito, usa o primeiro da lista
-                    warehouse_id = warehouses[0].get("id")
-                
-                # Encontrar ID do depósito de destino para transferências
+                        elif "full" in nome_deposito and "full" in warehouse_lower:
+                            warehouse_id = w.get("id")
+                            logger.info(f"Depósito FULL encontrado: {nome_deposito} (ID: {warehouse_id})")
+                            break
+
+                # Encontrar ID do depósito de destino para transferências - VERSÃO MELHORADA
+                target_warehouse_id = None
                 if operation == "transferir" and target_warehouse:
-                    for w in warehouses:
-                        if target_warehouse.lower() in w.get("nome", "").lower():
+                    target_warehouse_lower = target_warehouse.lower()
+                    for w in warehouses_with_names:
+                        nome_deposito = w.get("nome", "").lower()
+                        
+                        if "principal" in nome_deposito and ("principal" in target_warehouse_lower or "padrão" in target_warehouse_lower):
                             target_warehouse_id = w.get("id")
+                            logger.info(f"Depósito de destino (PRINCIPAL) encontrado: {nome_deposito} (ID: {target_warehouse_id})")
+                            break
+                        elif "full" in nome_deposito and "full" in target_warehouse_lower:
+                            target_warehouse_id = w.get("id")
+                            logger.info(f"Depósito de destino (FULL) encontrado: {nome_deposito} (ID: {target_warehouse_id})")
                             break
                 
                 # Verificar se encontrou os depósitos
@@ -617,7 +657,15 @@ class StockAgent:
                             "message": "Erro na transferência: " + 
                                       result_saida.get("message", "") + " / " + 
                                       result_entrada.get("message", "")
-                        }
+                        }          
+                
+                elif operation == "balanço":
+                    result = await self.bling_tool.update_stock_in_api(
+                        product_id=product_id,
+                        warehouse_id=warehouse_id,
+                        operation="B",  # B = Balanço
+                        quantity=quantity  # Quantidade total desejada
+                    )
                 
                 # Formata a resposta
                 return json.dumps({
@@ -658,27 +706,32 @@ class StockAgent:
         prompt = ChatPromptTemplate.from_messages([
             ("system", """Você é um assistente especializado em gerenciamento de estoque para e-commerce.
 
-    Para consultas de estoque:
-    1. Use o comando "@estoque verificar SKU-123" ou "@bot consultar SKU-123"
-    2. O sistema mostrará nome, preço e estoque atual do produto
+Para consultas de estoque:
+1. Use o comando "@estoque verificar SKU-123" ou "@bot consultar SKU-123"
+2. O sistema mostrará nome, preço e estoque atual do produto
 
-    Para adicionar estoque:
-    1. Use "@estoque adicionar X unidades do SKU-123"
-    2. Especifique o depósito se necessário: "@estoque adicionar X SKU-123 depósito principal"
+Para adicionar estoque:
+1. Use "@estoque adicionar X unidades do SKU-123"
+2. Especifique o depósito se necessário: "@estoque adicionar X SKU-123 depósito principal"
 
-    Para remover estoque:
-    1. Use "@estoque remover X unidades do SKU-123"
-    2. Especifique o depósito se necessário: "@estoque remover X SKU-123 depósito full"
+Para remover estoque:
+1. Use "@estoque remover X unidades do SKU-123"
+2. Especifique o depósito se necessário: "@estoque remover X SKU-123 depósito full"
 
-    Para transferir estoque:
-    1. Use "@estoque transferir X unidades do SKU-123 do depósito A para B"
+Para transferir estoque:
+1. Use "@estoque transferir X unidades do SKU-123 do depósito A para B"
 
-    Regras importantes:
-    1. Sempre confirme operações críticas antes de executar
-    2. Mostre o estoque atual antes e depois das operações
-    3. Peça confirmação para alterações de estoque
-    4. Use números inteiros para quantidades
-    5. Sempre responda em português"""),
+Regras importantes:
+1. Sempre confirme operações críticas antes de executar
+2. Mostre o estoque atual antes e depois das operações
+3. Peça confirmação para alterações de estoque
+4. Use números inteiros para quantidades
+5. Sempre responda em português
+
+Você tem acesso às seguintes ferramentas:
+{tools}
+
+Os nomes das ferramentas são: {tool_names}"""),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -690,53 +743,66 @@ class StockAgent:
             return_messages=True
         )
 
-        # Configura o agente usando o novo formato
-        from langchain.agents import create_openai_functions_agent
-        
-        agent = create_openai_functions_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=prompt
+        tools_for_agent = self.tools
+        agent = (
+            {
+                "input": lambda x: x["input"],
+                "chat_history": lambda x: x.get("chat_history", []),
+                "tools": lambda x: [t.metadata for t in tools_for_agent],
+                "tool_names": lambda x: ", ".join([t.name for t in tools_for_agent]),
+                "agent_scratchpad": lambda x: format_to_openai_functions(x.get("intermediate_steps", []))
+            }
+            | prompt 
+            | self.llm
+            | OpenAIFunctionsAgentOutputParser()
         )
 
         # Cria o executor do agente
         agent_executor = AgentExecutor(
             agent=agent,
             tools=self.tools,
-            memory=memory,
+            memory=memory,            
+            verbose=True,
             handle_parsing_errors=True
         )
 
         return agent_executor
 
     async def process_message(self, user_id: str, message: str) -> str:
-        """
-        Processa uma mensagem recebida de um usuário
-        """
+        """Processa uma mensagem recebida de um usuário"""
         try:
-            # Verificar se é uma resposta de confirmação/cancelamento
+            # Verificar comandos diretos que não precisam de processamento por IA
+            # No método process_message, na parte que processa a confirmação (~linha 765)
+            
+            # Nesse trecho:
             if "@confirmar" in message.lower():
                 # Verifica se existe uma operação pendente para este usuário
                 if user_id in self.conversation_state and "pending_operation" in self.conversation_state[user_id]:
                     # Recupera a operação pendente
                     operation = self.conversation_state[user_id]["pending_operation"]
                     
-                    # Verifica se a operação expirou (mais de 5 minutos)
-                    if (datetime.now() - operation["timestamp"]).total_seconds() > 300:
-                        # Limpa o estado e informa que expirou
-                        del self.conversation_state[user_id]
-                        return "⏰ A operação expirou. Por favor, inicie novamente."
+                    # Adicionar este debug:
+                    logger.info(f"Operação pendente recuperada: {operation}")
                     
                     # Executa a operação confirmada
-                    update_tool = self.tools[1]  # Ferramenta de atualização
+                    update_tool = self.tools[1]
                     
-                    # Executa a operação
-                    result = await update_tool.run(operation["params"])
+                    # Modificar esta linha:
+                    # Resultado: await update_tool.run(operation["params"])
+                    
+                    # Para:
+                    params = operation["params"]
+                    if not params.get("warehouse") and params.get("operation") != "transferir":
+                        # Se não tem depósito especificado, assume o depósito principal (ID 1511573259)
+                        params["warehouse"] = "depósito principal"
+                        logger.info("Usando depósito principal como padrão para a operação")
+                    
+                    result = await update_tool.run(params)
                     
                     # Limpa o estado
                     del self.conversation_state[user_id]
                     
-                    # Processa o resultado
+                    # Processamento do resultado igual ao código original...
                     try:
                         data = json.loads(result)
                         if data.get("success"):
@@ -770,8 +836,8 @@ class StockAgent:
                 else:
                     return "❓ Não há operação pendente para confirmar."
             
-            # Verificar se é um cancelamento
             elif "@cancelar" in message.lower():
+                # Código existente para cancelamento...
                 if user_id in self.conversation_state and "pending_operation" in self.conversation_state[user_id]:
                     operation = self.conversation_state[user_id]["pending_operation"]
                     operation_type = operation["operation"]
@@ -784,218 +850,282 @@ class StockAgent:
                 else:
                     return "❓ Não há operação pendente para cancelar."
             
-            # Verificar comandos básicos como ajuda ou consulta direta
             elif any(cmd in message.lower() for cmd in ["comandos", "ajuda", "help"]):
-                # Retorna a mensagem de ajuda
+                # Retorna a mensagem de ajuda existente              
+                
                 return """🤖 *Comandos Disponíveis*
                         1️⃣ *Consultar Estoque*
-        • `@estoque verificar SKU-123`
-        • `@bot consultar SKU-123`
-
-        2️⃣ *Adicionar Estoque*
-        • `@estoque adicionar 10 unidades do SKU-123`
-        • `@estoque add 5 SKU-456 depósito principal`
-
-        3️⃣ *Remover Estoque*
-        • `@estoque remover 3 unidades do SKU-789`
-        • `@estoque remove 2 SKU-123 depósito full`
-
-        4️⃣ *Transferir Estoque*
-        • `@estoque transferir 5 SKU-123 do principal para full`
-
-        📝 *Observações*:
-        • Use sempre o SKU correto do produto
-        • Especifique a quantidade claramente
-        • Mencione o depósito quando necessário
-        • Aguarde confirmação em operações críticas
-
-        ❓ Para mais ajuda, use:
-        `@bot ajuda [comando]`
-        Exemplo: `@bot ajuda transferir`"""
+                        • `@estoque verificar SKU-123`
+                        • `@bot consultar SKU-123`
                 
-            # Consulta direta via regex simples para SKUs
-            elif "@estoque verificar" in message or "@bot consultar" in message:
-                sku_match = re.search(r'(?:verificar|consultar)\s+([\w\-\.\/\+]+)', message)
-                if sku_match:
-                    sku = sku_match.group(1)
-                    logger.info(f"Consultando SKU: {sku}")
-                    
-                    # Usa diretamente a ferramenta de busca
-                    search_tool = self.tools[0]  # Ferramenta de busca é a primeira na lista
-                    result = await search_tool.run({"sku": sku})
-                    logger.info(f"Resultado da busca recebido, tamanho: {len(result)} caracteres")
-                    
-                # Processa o resultado
-                    try:                        
-                        data = json.loads(result)
-                        if data.get("found"):
-                            product = data["product"]
-                            stocks = data.get("stock", [])
-                            
-                            response = f"📦 *Produto: {product['name']}*\n"
-                            response += f"SKU: `{product['sku']}`\n\n"
-                            
-                            # Mostrar estoque do produto atual
-                            response += "*Estoque por Depósito:*\n"
-                            
-                            if stocks:
-                                for stock in stocks:
-                                    warehouse_name = stock.get('warehouse_name', 'Depósito')
-                                    quantity = stock.get('quantity', 0)
-                                    response += f"- {warehouse_name}: {quantity} unidades\n"
-                            else:
-                                response += "- Nenhum estoque encontrado para este produto\n"
-                            
-                            # Mostrar informações do pai se for variação
-                            if "parent" in data and data["parent"]:
-                                parent = data["parent"]
-                                response += f"\n*Produto Pai:* {parent['name']}\n"
-                                response += f"SKU do Pai: `{parent['sku']}`\n"
-                            
-                            # Mostrar variações se for produto pai
-                            if "variations" in data and data["variations"]:
-                                response += "\n*Variações deste produto:*\n"
-                                
-                                for i, variation in enumerate(data["variations"], 1):
-                                    response += f"{i}. *{variation['name']}*\n"
-                                    response += f"   SKU: `{variation['sku']}`\n"
-                                    
-                                    # Mostrar estoque de cada variação
-                                    if "stock" in variation and variation["stock"]:
-                                        for stock in variation["stock"]:
-                                            warehouse_name = stock.get('warehouse_name', 'Depósito')
-                                            quantity = stock.get('quantity', 0)
-                                            response += f"   - {warehouse_name}: {quantity} unidades\n"
-                                    else:
-                                        response += "   - Sem estoque disponível\n"
-                            
-                            return response
-                        else:
-                            return f"❌ Produto com SKU {sku} não encontrado."
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Erro ao decodificar JSON: {e}")
-                        logger.error(f"Conteúdo recebido: {result}")
-                        return "❌ Erro ao processar informações do produto."
-                else:
-                    return "❌ Por favor, especifique o SKU do produto.\nExemplo: `@estoque verificar SKU123`"
+                        2️⃣ *Adicionar Estoque*
+                        • `@estoque adicionar 10 unidades do SKU-123`
+                        • `@estoque add 5 SKU-456 depósito principal`
+                
+                        3️⃣ *Remover Estoque*
+                        • `@estoque remover 3 unidades do SKU-789`
+                        • `@estoque remove 2 SKU-123 depósito full`
+                
+                        4️⃣ *Transferir Estoque*
+                        • `@estoque transferir 5 SKU-123 do principal para full`
+                        
+                        5️⃣ *Balanço de Estoque*
+                        • `@estoque balanço SKU-123 ajustar para 10 unidades`
+                        • `@estoque ajustar SKU-456 para 5 unidades no depósito principal`
+                
+                        📝 *Observações*:
+                        • Use sempre o SKU correto do produto
+                        • Especifique a quantidade claramente
+                        • Mencione o depósito quando necessário
+                        • Aguarde confirmação em operações críticas
+                
+                        ❓ Para mais ajuda, use:
+                        `@bot ajuda [comando]`
+                        Exemplo: `@bot ajuda transferir`"""
             
-            # PARA TODOS OS OUTROS CASOS: usa o LLM para interpretar
+            # ABORDAGEM INTELIGENTE BASEADA EM IA - Para qualquer outro comando
             else:
-                logger.info(f"Usando LLM para interpretar: '{message}'")
-                # Processar via LLM para interpretar a intenção
-                result = await self.agent_executor.ainvoke({"input": message})
-                response = result.get("output", "")
+                # ETAPA 1: Usar o LLM para extrair estruturadamente a intenção e parâmetros
                 
-                if not response:
-                    return "Desculpe, não consegui processar sua solicitação."
+                extraction_prompt = f"""
+                Analise esta mensagem e extraia as informações relevantes para gerenciamento de estoque:
+                "{message}"
                 
-                # Verificar se a resposta indica uma operação de estoque que precisa de confirmação
-                if any(op in response.lower() for op in ["adicionar", "remover", "transferir"]) and "estoque" in response.lower():
-                    logger.info(f"Possível operação de estoque detectada na resposta: '{response[:100]}...'")
-                    # Tentar extrair informações da resposta para criar uma operação pendente
+                Responda apenas em formato JSON com as seguintes chaves:
+                {{
+                    "operation_type": "consultar"|"adicionar"|"remover"|"transferir"|"balanço"|"outro",
+                    "sku": "código do produto ou null se não houver",
+                    "quantity": número ou null se não aplicável,
+                    "source_warehouse": "depósito onde a operação será realizada (ou origem no caso de transferência)",
+                    "target_warehouse": "depósito destino (apenas para transferências)",
+                    "confidence": número entre 0 e 1 indicando sua confiança nesta interpretação
+                }}
+                
+                Para operações "adicionar", "remover" ou "balanço", o depósito mencionado deve ser extraído como "source_warehouse".
+                Para "transferir", extraia o depósito de origem como "source_warehouse" e o destino como "target_warehouse".
+                """
+                
+                logger.info(f"Extraindo parâmetros via LLM para a mensagem: '{message}'")
+                
+                # Usar o LLM para extrair parâmetros estruturados
+                extraction_response = await self.llm.ainvoke([
+                    {"role": "system", "content": "Você é um analisador de texto que extrai parâmetros estruturados."},
+                    {"role": "user", "content": extraction_prompt}
+                ])
+                
+                # Extrair o JSON da resposta
+                try:
+                    extracted_text = extraction_response.content
+                    logger.info(f"Texto extraído do LLM: {extracted_text[:100]}...")
+                    
+                    # Verificar se a resposta está vazia
+                    if not extracted_text or extracted_text.isspace():
+                        logger.warning("Resposta de extração vazia, usando fallback")
+                        raise ValueError("Resposta vazia")
+                    
+                    # Limpar o texto para garantir que temos apenas JSON válido
+                    json_text = None
+                    
+                    # Tentar diferentes formatos comuns
+                    if "```json" in extracted_text:
+                        # Formato código markdown
+                        match = re.search(r'```json\s*(.*?)\s*```', extracted_text, re.DOTALL)
+                        if match:
+                            json_text = match.group(1)
+                    elif "```" in extracted_text:
+                        # Outro formato de código sem especificar json
+                        match = re.search(r'```\s*(.*?)\s*```', extracted_text, re.DOTALL)
+                        if match:
+                            json_text = match.group(1)
+                    elif "{" in extracted_text and "}" in extracted_text:
+                        # JSON sem formatação de código
+                        match = re.search(r'\{.*\}', extracted_text, re.DOTALL)
+                        if match:
+                            json_text = match.group(0)
+                    
+                    # Se não conseguiu extrair, usar o texto completo
+                    if not json_text:
+                        json_text = extracted_text.strip()
+                    
+                    logger.info(f"Tentando processar JSON: {json_text[:100]}...")
+                    
+                    # Tentar fazer parse do JSON
                     try:
-                        # Analisar a resposta do LLM para extrair detalhes da operação
-                        operation_type = None
-                        if "adicionar" in response.lower():
-                            operation_type = "adicionar"
-                        elif "remover" in response.lower(): 
-                            operation_type = "remover"
-                        elif "transferir" in response.lower():
-                            operation_type = "transferir"
-                            
-                        # Extrair SKU - podemos usar regex simples aqui
-                        sku_match = re.search(r'SKU[:\s]?\s*[`"]?([\w\-\.\/\+]+)[`"]?', response)
-                        if not sku_match:  # Tenta outro padrão comum
-                            sku_match = re.search(r'código[:\s]?\s*[`"]?([\w\-\.\/\+]+)[`"]?', response, re.IGNORECASE)
-                        sku = sku_match.group(1) if sku_match else None
+                        params = json.loads(json_text)
+                        logger.info(f"Parâmetros extraídos pela IA: {params}")
+                    except json.JSONDecodeError:
+                        # Se falhar, criar um objeto JSON padrão para indicar baixa confiança
+                        logger.warning("Falha ao decodificar JSON, usando objeto padrão")
+                        params = {
+                            "operation_type": "outro",
+                            "sku": None,
+                            "quantity": None,
+                            "source_warehouse": None,
+                            "target_warehouse": None,
+                            "confidence": 0.1
+                        }
+                    
+                    # Resto do código continua como antes...
+                    
+                    # ETAPA 2: Processar com base na intenção identificada
+                    operation_type = params.get("operation_type")
+                    sku = params.get("sku")
+                    
+                    # Para consulta de estoque
+                    if operation_type == "consultar" and sku:
+                        logger.info(f"Consulta de estoque para SKU: {sku}")
+                        search_tool = self.tools[0]
+                        result = await search_tool.run({"sku": sku})
                         
-                        # Extrair quantidade
-                        qty_match = re.search(r'(\d+)\s*unidades?', response)
-                        if not qty_match:  # Tenta outro padrão
-                            qty_match = re.search(r'quantidade[:\s]?\s*(\d+)', response, re.IGNORECASE)
-                        quantity = int(qty_match.group(1)) if qty_match else 1
-                        
-                        logger.info(f"Extraído: operação={operation_type}, sku={sku}, quantidade={quantity}")
-                        
-                        if operation_type and sku:
-                            # Buscar informações do produto para confirmar
-                            search_tool = self.tools[0]
-                            product_data = await search_tool.run({"sku": sku})
-                            product_info = json.loads(product_data)
-                            
-                            if product_info.get("found"):
-                                product = product_info["product"]
-                                product_name = product.get("name")
+                        # Processamento igual ao código existente para consultas
+                        try:                        
+                            data = json.loads(result)
+                            if data.get("found"):
+                                product = data["product"]
+                                stocks = data.get("stock", [])
                                 
-                                # Determinar depósitos e parâmetros com base no tipo de operação
-                                params = {
-                                    "sku": sku,
-                                    "quantity": quantity,
-                                    "operation": operation_type
-                                }
+                                response = f"📦 *Produto: {product['name']}*\n"
+                                response += f"SKU: `{product['sku']}`\n\n"
                                 
-                                # Para transferências, tentar extrair depósitos
-                                if operation_type == "transferir":
-                                    source_match = re.search(r'de\s+[`"]?([\w\s]+)[`"]?', response, re.IGNORECASE)
-                                    target_match = re.search(r'para\s+[`"]?([\w\s]+)[`"]?', response, re.IGNORECASE)
+                                # Mostrar estoque do produto atual
+                                response += "*Estoque por Depósito:*\n"
+                                
+                                if stocks:
+                                    for stock in stocks:
+                                        warehouse_name = stock.get('warehouse_name', 'Depósito')
+                                        quantity = stock.get('quantity', 0)
+                                        response += f"- {warehouse_name}: {quantity} unidades\n"
+                                else:
+                                    response += "- Nenhum estoque encontrado para este produto\n"
+                                
+                                # Mostrar informações do pai e variações se disponíveis
+                                # (mantido igual ao código existente)
+                                if "parent" in data and data["parent"]:
+                                    parent = data["parent"]
+                                    response += f"\n*Produto Pai:* {parent['name']}\n"
+                                    response += f"SKU do Pai: `{parent['sku']}`\n"
+                                
+                                if "variations" in data and data["variations"]:
+                                    response += "\n*Variações deste produto:*\n"
                                     
-                                    if source_match and target_match:
-                                        params["warehouse"] = source_match.group(1).strip()
-                                        params["target_warehouse"] = target_match.group(1).strip()
-                                else:
-                                    # Para adicionar/remover, extrair depósito
-                                    depot_match = re.search(r'depósito\s+[`"]?([\w\s]+)[`"]?', response, re.IGNORECASE)
-                                    if depot_match:
-                                        params["warehouse"] = depot_match.group(1).strip()
-                                
-                                logger.info(f"Parâmetros da operação: {params}")
-                                
-                                # Salvar a operação para confirmação
-                                self.conversation_state[user_id] = {
-                                    "pending_operation": {
-                                        "operation": operation_type,
-                                        "sku": sku,
-                                        "product_name": product_name,
-                                        "quantity": quantity,
-                                        "params": params,
-                                        "timestamp": datetime.now()
-                                    }
-                                }
-                                
-                                # Criar mensagem de confirmação personalizada
-                                confirm_msg = f"🔍 *Confirmar operação de estoque:*\n\n"
-                                confirm_msg += f"• Operação: {operation_type}\n"
-                                confirm_msg += f"• Produto: {product_name}\n"
-                                confirm_msg += f"• SKU: `{sku}`\n"
-                                confirm_msg += f"• Quantidade: {quantity} unidades\n"
-                                
-                                # Adicionar informações específicas por operação
-                                if operation_type == "transferir":
-                                    confirm_msg += f"• De: {params.get('warehouse', 'Depósito padrão')}\n"
-                                    confirm_msg += f"• Para: {params.get('target_warehouse', 'Depósito destino')}\n"
-                                else:
-                                    if "warehouse" in params:
-                                        confirm_msg += f"• Depósito: {params['warehouse']}\n"
+                                    for i, variation in enumerate(data["variations"], 1):
+                                        response += f"{i}. *{variation['name']}*\n"
+                                        response += f"   SKU: `{variation['sku']}`\n"
                                         
-                                confirm_msg += f"\n*Para confirmar, responda com \"@confirmar\".*\n"
-                                confirm_msg += f"*Para cancelar, responda com \"@cancelar\".*\n"
-                                confirm_msg += f"_(Esta operação expira em 5 minutos)_"
+                                        if "stock" in variation and variation["stock"]:
+                                            for stock in variation["stock"]:
+                                                warehouse_name = stock.get('warehouse_name', 'Depósito')
+                                                quantity = stock.get('quantity', 0)
+                                                response += f"   - {warehouse_name}: {quantity} unidades\n"
+                                        else:
+                                            response += "   - Sem estoque disponível\n"
                                 
-                                return confirm_msg
-                    except Exception as e:
-                        logger.error(f"Erro ao analisar resposta para confirmação: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        # Se falhar a extração, retorna a resposta original do LLM
-                
-                # Se não for uma operação que precisa de confirmação, retorna a resposta do LLM
-                return response
-                
+                                return response
+                            else:
+                                return f"❌ Produto com SKU {sku} não encontrado."
+                        except json.JSONDecodeError:
+                            return "❌ Erro ao processar informações do produto."
+                    
+                    # Para operações que modificam estoque (adicionar, remover, transferir)
+                    elif operation_type in ["adicionar", "remover", "transferir", "balanço"] and sku:
+                        # Validar o produto antes de preparar a operação
+                        search_tool = self.tools[0]
+                        product_data = await search_tool.run({"sku": sku})
+                        product_info = json.loads(product_data)
+                        
+                        if not product_info.get("found"):
+                            return f"❌ Produto com SKU {sku} não encontrado. Por favor, verifique o código e tente novamente."
+                        
+                        product = product_info["product"]
+                        product_name = product.get("name", "Produto")
+                        quantity = params.get("quantity", 1)
+                        
+                        # Preparar os parâmetros para a operação
+                        operation_params = {
+                            "sku": sku,
+                            "quantity": quantity,
+                            "operation": operation_type
+                        }
+                        
+                        # Adicionar informações de depósito quando aplicável
+                        if operation_type == "transferir":
+                            operation_params["warehouse"] = params.get("source_warehouse")
+                            operation_params["target_warehouse"] = params.get("target_warehouse")
+                        else:
+                            operation_params["warehouse"] = params.get("source_warehouse")
+                        
+                        logger.info(f"Preparando operação: {operation_params}")
+                        
+                        # Salvar a operação pendente para confirmação
+                        self.conversation_state[user_id] = {
+                            "pending_operation": {
+                                "operation": operation_type,
+                                "sku": sku,
+                                "product_name": product_name,
+                                "quantity": quantity,
+                                "params": operation_params,
+                                "timestamp": datetime.now()
+                            }
+                        }
+                        
+                        # Preparar a mensagem de confirmação
+                        # Criar mensagem de confirmação personalizada
+                        confirm_msg = f"🔍 *Confirmar operação de estoque:*\n\n"
+                        confirm_msg += f"• Operação: {operation_type}\n"
+                        confirm_msg += f"• Produto: {product_name}\n"
+                        confirm_msg += f"• SKU: `{sku}`\n"
+                        confirm_msg += f"• Quantidade: {quantity} unidades\n"
+                        
+                        # Adicionar informações específicas por operação
+                        if operation_type == "transferir":
+                            source = params.get("source_warehouse", "Depósito padrão")
+                            target = params.get("target_warehouse", "Depósito destino")
+                            confirm_msg += f"• De: {source}\n"
+                            confirm_msg += f"• Para: {target}\n"
+                        else:
+                            warehouse = params.get("source_warehouse")
+                            if warehouse:
+                                confirm_msg += f"• Depósito: {warehouse}\n"
+                        
+                        # Adicionar estoque atual para contexto do usuário
+                        confirm_msg += "\n*Estoque atual:*\n"
+                        for stock in product_info.get("stock", []):
+                            warehouse_name = stock.get('warehouse_name', 'Depósito')
+                            current_qty = stock.get('quantity', 0)
+                            confirm_msg += f"- {warehouse_name}: {current_qty} unidades\n"
+                                
+                        confirm_msg += f"\n*Para confirmar, responda com \"@confirmar\".*\n"
+                        confirm_msg += f"*Para cancelar, responda com \"@cancelar\".*\n"
+                        confirm_msg += f"_(Esta operação expira em 5 minutos)_"
+                        
+                        return confirm_msg
+                    
+                    # Para outros casos ou se a IA não identificou corretamente
+                    else:
+                        # Confiança baixa ou operação desconhecida, processar via LLM genérico
+                        if params.get("confidence", 0) < 0.7 or operation_type == "outro":
+                            logger.info(f"Baixa confiança ou tipo desconhecido, usando LLM genérico")
+                            result = await self.agent_executor.ainvoke({"input": message})
+                            return result.get("output", "Desculpe, não consegui processar sua solicitação.")
+                        else:
+                            return "❓ Não consegui entender o que você deseja fazer com o estoque. Por favor, tente novamente com um comando mais claro."
+                    
+                except Exception as e:
+                    logger.error(f"Erro ao processar extração: {str(e)}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    
+                    # Fallback para o processamento original
+                    logger.info(f"Usando LLM padrão como fallback")
+                    result = await self.agent_executor.ainvoke({"input": message})
+                    return result.get("output", "Desculpe, não consegui processar sua solicitação.")
+                    
         except Exception as e:
             logger.error(f"Erro ao processar mensagem: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             return "❌ Desculpe, ocorreu um erro ao processar sua solicitação. Por favor, tente novamente."
-                
+                    
     def cleanup_expired_states(self, timeout_minutes: int = 15):
         """
         Limpa estados de conversação expirados
@@ -1015,4 +1145,3 @@ class StockAgent:
         
         if expired_users:
             logger.info(f"Limpados {len(expired_users)} estados de conversação expirados")
-    
