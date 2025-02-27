@@ -808,9 +808,9 @@ Os nomes das ferramentas são: {tool_names}"""),
                         if data.get("success"):
                             # Prepara a resposta de sucesso
                             response = f"✅ *Operação realizada com sucesso!*\n\n"
-                            response += f"Produto: {operation['product_name']}\n"
-                            response += f"SKU: `{operation['sku']}`\n"
-                            response += f"Operação: {operation['operation']} {operation['quantity']} unidades\n"
+                            response += f"*Produto:* {operation['product_name']}\n"
+                            response += f"*SKU:* `{operation['sku']}`\n"
+                            response += f"*Operação:* {operation['operation']} {operation['quantity']} unidades\n"
                             
                             # Busca os dados atualizados
                             search_tool = self.tools[0]
@@ -818,13 +818,12 @@ Os nomes das ferramentas são: {tool_names}"""),
                             new_data = json.loads(new_stock_info)
                             
                             # Mostra o estoque atualizado
-                            response += "\n*Estoque atualizado:*\n"
-                            
+                            response += "\n📊 *Estoque atualizado:*\n"
                             if new_data.get("found") and new_data.get("stock"):
                                 for stock in new_data["stock"]:
                                     warehouse_name = stock.get('warehouse_name', 'Depósito')
                                     quantity = stock.get('quantity', 0)
-                                    response += f"- {warehouse_name}: {quantity} unidades\n"
+                                    response += f"• {warehouse_name}: {quantity} unidades\n"
                             
                             return response
                         else:
@@ -846,42 +845,67 @@ Os nomes das ferramentas são: {tool_names}"""),
                     # Limpa o estado
                     del self.conversation_state[user_id]
                     
-                    return f"🚫 Operação de {operation_type} para produto '{product_name}' cancelada."
+                    return f"🚫 *Operação cancelada:*\n\n• Tipo: {operation_type}\n• Produto: {product_name}\n\nVocê pode iniciar uma nova operação quando quiser."
                 else:
                     return "❓ Não há operação pendente para cancelar."
             
+                        # Substituir a função de ajuda (~linha 836)
+            
             elif any(cmd in message.lower() for cmd in ["comandos", "ajuda", "help"]):
-                # Retorna a mensagem de ajuda existente              
-                
-                return """🤖 *Comandos Disponíveis*
-                        1️⃣ *Consultar Estoque*
-                        • `@estoque verificar SKU-123`
-                        • `@bot consultar SKU-123`
-                
-                        2️⃣ *Adicionar Estoque*
-                        • `@estoque adicionar 10 unidades do SKU-123`
-                        • `@estoque add 5 SKU-456 depósito principal`
-                
-                        3️⃣ *Remover Estoque*
-                        • `@estoque remover 3 unidades do SKU-789`
-                        • `@estoque remove 2 SKU-123 depósito full`
-                
-                        4️⃣ *Transferir Estoque*
-                        • `@estoque transferir 5 SKU-123 do principal para full`
-                        
-                        5️⃣ *Balanço de Estoque*
-                        • `@estoque balanço SKU-123 ajustar para 10 unidades`
-                        • `@estoque ajustar SKU-456 para 5 unidades no depósito principal`
-                
-                        📝 *Observações*:
-                        • Use sempre o SKU correto do produto
-                        • Especifique a quantidade claramente
-                        • Mencione o depósito quando necessário
-                        • Aguarde confirmação em operações críticas
-                
-                        ❓ Para mais ajuda, use:
-                        `@bot ajuda [comando]`
-                        Exemplo: `@bot ajuda transferir`"""
+                # Comando de ajuda solicitado
+                return """📦 *ASSISTENTE DE ESTOQUE - GUIA DE COMANDOS*
+
+Olá! Sou o assistente que gerencia o estoque da Luar Shop. Aqui está tudo que posso fazer:
+
+⚙️ *COMO ME CHAMAR:*
+- Mencione-me diretamente com `@5516993097311` no início da sua mensagem
+
+📊 *OPERAÇÕES DISPONÍVEIS:*
+
+1️⃣ *CONSULTAS DE ESTOQUE*
+  "@mencionar verificar SKU-123"
+  "@mencionar consultar SKU-123"
+  "@mencionar como está o estoque do SKU-123?"
+
+→ _Mostra o nome do produto, quantidade em estoque por depósito e informações de variações/produtos relacionados_
+
+2️⃣ *ADICIONAR ESTOQUE*
+  "@mencionar adicionar 10 unidades do SKU-123"
+  "@mencionar add 5 SKU-456 no depósito principal"
+
+→ _Aumenta o estoque no depósito especificado (ou no Principal se não informado)_
+
+3️⃣ *REMOVER ESTOQUE*
+  "@mencionar remover 3 unidades do SKU-789"
+  "@mencionar baixar 2 SKU-456 do depósito full"
+
+→ _Diminui o estoque do depósito especificado (ou do Principal se não informado)_
+
+4️⃣ *TRANSFERIR ENTRE DEPÓSITOS*
+  "@mencionar transferir 5 SKU-123 do principal para o full"
+  
+→ _Move produtos de um depósito para outro_
+
+5️⃣ *BALANÇO DE ESTOQUE*
+  "@mencionar balanço SKU-123 ajustar para 10 unidades"
+
+→ _Define o estoque para um valor específico (independente do valor atual)_
+
+🏪 *DEPÓSITOS DISPONÍVEIS:*
+- *Depósito Principal* (use "principal" ou "padrão")
+- *Depósito Full* (use "full")
+
+🔐 *PROCESSO DE SEGURANÇA:*
+1. Toda operação que altera estoque exige confirmação
+2. Responda com `@confirmar` para executar ou `@cancelar` para desistir
+3. As operações pendentes expiram após 5 minutos
+
+💡 *DICAS IMPORTANTES:*
+- Use o SKU exato do produto para resultados precisos
+- Para produtos com variações, consulte primeiro o SKU pai
+- Especifique sempre o depósito para evitar erros
+- O sistema funciona apenas em grupos, não em conversas privadas
+- Verifico o estoque antes e depois de cada operação para sua segurança"""
             
             # ABORDAGEM INTELIGENTE BASEADA EM IA - Para qualquer outro comando
             else:
@@ -985,16 +1009,15 @@ Os nomes das ferramentas são: {tool_names}"""),
                                 stocks = data.get("stock", [])
                                 
                                 response = f"📦 *Produto: {product['name']}*\n"
-                                response += f"SKU: `{product['sku']}`\n\n"
+                                response += f"*SKU:* `{product['sku']}`\n\n"
                                 
                                 # Mostrar estoque do produto atual
-                                response += "*Estoque por Depósito:*\n"
-                                
+                                response += "📊 *Estoque por Depósito:*\n"
                                 if stocks:
                                     for stock in stocks:
                                         warehouse_name = stock.get('warehouse_name', 'Depósito')
                                         quantity = stock.get('quantity', 0)
-                                        response += f"- {warehouse_name}: {quantity} unidades\n"
+                                        response += f"• {warehouse_name}: *{quantity}* unidades\n"
                                 else:
                                     response += "- Nenhum estoque encontrado para este produto\n"
                                 
@@ -1071,10 +1094,10 @@ Os nomes das ferramentas são: {tool_names}"""),
                         # Preparar a mensagem de confirmação
                         # Criar mensagem de confirmação personalizada
                         confirm_msg = f"🔍 *Confirmar operação de estoque:*\n\n"
-                        confirm_msg += f"• Operação: {operation_type}\n"
-                        confirm_msg += f"• Produto: {product_name}\n"
-                        confirm_msg += f"• SKU: `{sku}`\n"
-                        confirm_msg += f"• Quantidade: {quantity} unidades\n"
+                        confirm_msg += f"• *Operação:* {operation_type}\n"
+                        confirm_msg += f"• *Produto:* {product_name}\n"
+                        confirm_msg += f"• *SKU:* `{sku}`\n"
+                        confirm_msg += f"• *Quantidade:* {quantity} unidades\n"
                         
                         # Adicionar informações específicas por operação
                         if operation_type == "transferir":

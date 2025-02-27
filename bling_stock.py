@@ -613,20 +613,38 @@ async def webhook_handler(request: Request):
             logger.info("Mensagem sem texto - ignorando")
             return {"status": "success", "message": "Mensagem sem texto"}
             
-        # Determina se é mensagem de grupo
+        # Melhore a detecção do grupo:
         is_group = "@g.us" in sender
+        logger.info(f"Tipo de chat detectado: {'GRUPO' if is_group else 'PRIVADO'}, ID: {sender}")
+
+        # Adicione uma verificação mais rigorosa
+        if not is_group or ".us" not in sender:
+            logger.info(f"❌ Bloqueando mensagem privada de: {sender}")
+            return {"status": "success", "message": "Mensagens privadas são ignoradas"}
+            
         logger.info(f"Mensagem recebida - De: {participant if is_group else sender}, Texto: {text}, Grupo: {is_group}")
-        
-        # Para mensagens de grupo, verifica se mencionou o bot
-        if is_group and not any(mention in text.lower() for mention in ["@estoque", "@bot", "@stock"]):
+
+        # Se não é grupo, ignorar completamente
+        if not is_group:
+            logger.info("Mensagem privada - ignorando completamente")
+            return {"status": "success", "message": "Mensagem privada ignorada"}
+
+        # Verifica se mencionou o bot ou se é um comando de confirmação/cancelamento
+        is_confirmation_command = "@confirmar" in text.lower() or "@cancelar" in text.lower()
+        if is_group and not any(mention in text.lower() for mention in ["@estoque", "@bot", "@stock", "@5516993097311"]) and not is_confirmation_command:
             logger.info("Mensagem de grupo sem menção ao bot - ignorando")
             return {"status": "success", "message": "Mensagem ignorada (sem menção ao bot)"}
-        
+                
         # Processa a mensagem com o agente
         # Em grupo, usa o participant como sender para identificar quem mandou
         user_id = participant if is_group else sender
         response = await stock_agent.process_message(user_id, text)
         
+        # Adicione também uma verificação extra depois de extrair a resposta:
+        if response and not is_group:
+            logger.info(f"❌ Bloqueando resposta para chat privado: {sender}")
+            return {"status": "success", "message": "Bloqueado envio para chat privado"}
+            
         if response:
             # Envia resposta
             if bling_monitor and bling_monitor.whatsapp_client:
