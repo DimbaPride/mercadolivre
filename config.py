@@ -10,13 +10,6 @@ env_path = pathlib.Path(current_dir, '.env')
 print(f"Tentando carregar .env de: {env_path}")
 load_dotenv(dotenv_path=env_path)
 
-# Define valores fixos para o grupo (isso vai funcionar independente do .env)
-WHATSAPP_GROUP_ID = "120363296510746112@g.us"
-WHATSAPP_GROUP_NAME = "Estoque - Luar Shop"
-
-# Valores fixos para a instância do WhatsApp
-WHATSAPP_INSTANCE_NAME = "Luar Shop"
-WHATSAPP_INSTANCE_ID = "9bc8b989-81cc-4554-aa63-4f07d00caa6b"
 @dataclass
 class BlingConfig:
     """Configuração para API do Bling"""
@@ -55,7 +48,6 @@ class Settings:
 
 def load_settings() -> Settings:
     """Carrega todas as configurações do arquivo .env"""
-    # Usa valores das variáveis de ambiente, mas sobrescreve com os valores fixos
     return Settings(
         bling=BlingConfig(
             api_key=os.getenv('BLING_API_KEY', ''),
@@ -64,16 +56,15 @@ def load_settings() -> Settings:
             client_secret=os.getenv('BLING_CLIENT_SECRET', '')
         ),
         whatsapp=WhatsAppConfig(
-            api_key=os.getenv('WHATSAPP_API_KEY', '429683C4C977415CAAFCCE10F7D57E11'),
+            api_key=os.getenv('WHATSAPP_API_KEY', ''),  
             api_url=os.getenv('WHATSAPP_API_URL', 'https://evo.ariondigital.com.br'),
-            instance=os.getenv('WHATSAPP_INSTANCE') 
+            instance=os.getenv('WHATSAPP_INSTANCE', '')
         ),
         group=WhatsAppGroup(
-            # Usa os valores fixos definidos acima
-            group_id=WHATSAPP_GROUP_ID,
-            name=WHATSAPP_GROUP_NAME
+            group_id=os.getenv('WHATSAPP_GROUP_ID', ''),  
+            name=os.getenv('WHATSAPP_GROUP_NAME', '')     
         ),
-        check_interval=int(os.getenv('CHECK_INTERVAL', 30)),
+        check_interval=int(os.getenv('CHECK_INTERVAL', '30')),
         groq=GroqConfig(
             api_key=os.getenv('GROQ_API_KEY', '')
         ) if os.getenv('GROQ_API_KEY') else None

@@ -10,14 +10,17 @@ from langchain.agents import AgentExecutor, create_structured_chat_agent
 from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
 from langchain.agents.format_scratchpad import format_to_openai_functions
 
-from langchain.memory import ConversationBufferMemory
+# Remover esta importação
+# from langchain.memory import ConversationBufferMemory
+
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
 from langchain.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-
-
+# Novas importações para o sistema de memória
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
 
 # Importações para Bling API v3
 import httpx
@@ -319,6 +322,9 @@ class StockAgent:
         
         # Configura as ferramentas do agente
         self.tools = self._setup_tools()
+        
+        # Inicializa o dicionário de memória para armazenar históricos de conversa
+        self.memory_dict = {}
         
         # Configura o agente
         self.agent_executor = self._setup_agent()
@@ -737,12 +743,23 @@ Os nomes das ferramentas são: {tool_names}"""),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
         
-        # Configura a memória
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
+        # Classe para gerenciar histórico de mensagens em memória
+        class InMemoryChatMessageHistory(ChatMessageHistory):
+            """Chat message history that stores messages in memory."""
+            def __init__(self):
+                super().__init__()
+                
+            def clear(self):
+                """Clear the messages in history."""
+                self.messages = []
 
+        # Função para obter histórico da sessão
+        def get_session_history(session_id: str) -> ChatMessageHistory:
+            if session_id not in self.memory_dict:
+                self.memory_dict[session_id] = InMemoryChatMessageHistory()
+            return self.memory_dict[session_id]
+
+        # Configuração das ferramentas e agente
         tools_for_agent = self.tools
         agent = (
             {
@@ -756,12 +773,19 @@ Os nomes das ferramentas são: {tool_names}"""),
             | self.llm
             | OpenAIFunctionsAgentOutputParser()
         )
+        
+        # Adiciona suporte a histórico de mensagens
+        agent_with_chat_history = RunnableWithMessageHistory(
+            agent,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="chat_history"
+        )
 
         # Cria o executor do agente
         agent_executor = AgentExecutor(
-            agent=agent,
+            agent=agent_with_chat_history,  # Usa versão com histórico
             tools=self.tools,
-            memory=memory,            
             verbose=True,
             handle_parsing_errors=True
         )
@@ -1128,7 +1152,11 @@ Olá! Sou o assistente que gerencia o estoque da Luar Shop. Aqui está tudo que 
                         # Confiança baixa ou operação desconhecida, processar via LLM genérico
                         if params.get("confidence", 0) < 0.7 or operation_type == "outro":
                             logger.info(f"Baixa confiança ou tipo desconhecido, usando LLM genérico")
-                            result = await self.agent_executor.ainvoke({"input": message})
+                            # Atualizado para usar o session_id
+                            result = await self.agent_executor.ainvoke(
+                                {"input": message},
+                                config={"configurable": {"session_id": user_id}}
+                            )
                             return result.get("output", "Desculpe, não consegui processar sua solicitação.")
                         else:
                             return "❓ Não consegui entender o que você deseja fazer com o estoque. Por favor, tente novamente com um comando mais claro."
@@ -1138,9 +1166,12 @@ Olá! Sou o assistente que gerencia o estoque da Luar Shop. Aqui está tudo que 
                     import traceback
                     logger.error(traceback.format_exc())
                     
-                    # Fallback para o processamento original
+                    # Fallback para o processamento original - Atualizado para usar o session_id
                     logger.info(f"Usando LLM padrão como fallback")
-                    result = await self.agent_executor.ainvoke({"input": message})
+                    result = await self.agent_executor.ainvoke(
+                        {"input": message},
+                        config={"configurable": {"session_id": user_id}}
+                    )
                     return result.get("output", "Desculpe, não consegui processar sua solicitação.")
                     
         except Exception as e:

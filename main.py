@@ -1,4 +1,4 @@
-# main.py
+# main.py - com implementação robusta do gerenciador de token
 import logging
 import os
 from config import load_settings, validate_settings  # Importa do config.py
@@ -10,7 +10,7 @@ import time
 
 # Novas importações
 from stock_agent import StockAgent  # Novo agente de estoque
-from token_manager import BlingTokenManager  # Gerenciador de token
+from token_manager import BlingTokenManager  # Gerenciador de token melhorado
 
 # Configuração de logging
 logging.basicConfig(
@@ -50,12 +50,24 @@ async def main():
         logger.info(f"ID do Grupo: {settings.group.group_id}")
         logger.info(f"Instância WhatsApp: {settings.whatsapp.instance}")
         
-        # Inicializa o token manager e obtém um token válido para o monitor
-        logger.info("Inicializando gerenciador de token para o monitor...")
+        # Configuração do WhatsApp para notificações do token manager
+        whatsapp_config = {
+            'api_key': settings.whatsapp.api_key,
+            'api_url': settings.whatsapp.api_url,
+            'instance': settings.whatsapp.instance
+        }
+        
+        # Inicializa o token manager aprimorado com detecção de erros e recuperação
+        logger.info("Inicializando gerenciador de token melhorado para o monitor...")
         token_manager = BlingTokenManager(
             client_id=os.getenv('BLING_CLIENT_ID', ''),
-            client_secret=os.getenv('BLING_CLIENT_SECRET', '')
+            client_secret=os.getenv('BLING_CLIENT_SECRET', ''),
+            auth_callback_url=os.getenv('BLING_CALLBACK_URL', ''),
+            webhook_url=os.getenv('BLING_WEBHOOK_RECOVERY_URL', ''),
+            whatsapp_config=whatsapp_config,
+            admin_phone=os.getenv('ADMIN_PHONE', '')  # Número para receber alertas
         )
+        
         valid_token = await token_manager.get_valid_token()
         
         if valid_token:
@@ -103,7 +115,7 @@ async def main():
         logger.info("Servidor inicializado e pronto para receber webhooks!")
         
         # Inicializa o agente de estoque (se configurado)
-        agent = await init_stock_agent(settings)
+        agent = await init_stock_agent(settings, token_manager)
         if agent:
             logger.info("Inicializando agente de estoque global...")
             initialize_stock_agent(agent)
@@ -126,12 +138,16 @@ async def main():
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
 
-async def init_stock_agent(settings):
+async def init_stock_agent(settings, token_manager=None):
     """
     Inicializa o agente de estoque com Groq e token manager
     
     Esta função é independente do monitor de webhook e pode
     ser executada paralelamente.
+    
+    :param settings: Configurações do sistema
+    :param token_manager: Token manager já inicializado (opcional)
+    :return: Instância do StockAgent ou None
     """
     try:
         # Obter credenciais do ambiente
@@ -147,13 +163,23 @@ async def init_stock_agent(settings):
         if not groq_api_key:
             logger.warning("GROQ_API_KEY não encontrada. O agente de estoque não será inicializado.")
             return None
-            
-        # Inicializar o gerenciador de token
-        logger.info("Inicializando gerenciador de token Bling...")
-        token_manager = BlingTokenManager(
-            client_id=client_id,
-            client_secret=client_secret
-        )
+        
+        # Usar o token manager já inicializado se fornecido, caso contrário criar um novo
+        if not token_manager:
+            # Inicializar o gerenciador de token
+            logger.info("Inicializando gerenciador de token Bling para o agente...")
+            token_manager = BlingTokenManager(
+                client_id=client_id,
+                client_secret=client_secret,
+                auth_callback_url=os.getenv('BLING_CALLBACK_URL', ''),
+                webhook_url=os.getenv('BLING_WEBHOOK_RECOVERY_URL', ''),
+                whatsapp_config={
+                    'api_key': settings.whatsapp.api_key,
+                    'api_url': settings.whatsapp.api_url,
+                    'instance': settings.whatsapp.instance
+                },
+                admin_phone=os.getenv('ADMIN_PHONE', '')
+            )
         
         # Obter token válido (verificação inicial)
         token = await token_manager.get_valid_token()
@@ -195,4 +221,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Servidor encerrado pelo usuário")  
+        logger.info("Servidor encerrado pelo usuário")

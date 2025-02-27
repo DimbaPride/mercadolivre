@@ -4,10 +4,11 @@ import time
 import logging
 import asyncio
 import threading
-from datetime import datetime, timedelta
 import requests
 from requests.auth import HTTPBasicAuth
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from whatsapp_client import create_whatsapp_client, MessageType
 
 # Configuração de logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,9 +20,11 @@ class BlingTokenManager:
     - Gerencia renovação automática de tokens
     - Verifica validade de tokens antes de requisições
     - Inicializa um job em background para renovação periódica
+    - Mecanismo de recuperação quando o refresh token expira
     """
     
-    def __init__(self, client_id, client_secret, token_file="bling_token.json", env_file=".env"):
+    def __init__(self, client_id, client_secret, token_file="bling_token.json", env_file=".env", 
+                 auth_callback_url=None, webhook_url=None, whatsapp_config=None, admin_phone=None):
         """
         Inicializa o gerenciador de tokens
         
@@ -29,12 +32,36 @@ class BlingTokenManager:
         :param client_secret: Client Secret do aplicativo Bling
         :param token_file: Arquivo para armazenar os dados do token
         :param env_file: Arquivo .env para atualizar a variável BLING_API_KEY
+        :param auth_callback_url: URL de callback para autorização OAuth2
+        :param webhook_url: URL para notificação de webhook quando o token expirar
+        :param whatsapp_config: Configuração para cliente WhatsApp
+        :param admin_phone: Número de WhatsApp do administrador para receber alertas
         """
         self.client_id = client_id
         self.client_secret = client_secret
         self.token_file = token_file
         self.env_file = env_file
         self.token_url = "https://www.bling.com.br/Api/v3/oauth/token"
+        self.auth_callback_url = auth_callback_url
+        self.webhook_url = webhook_url
+        self.whatsapp_config = whatsapp_config
+        self.admin_phone = admin_phone
+        
+        # Inicializa o cliente WhatsApp se configurado
+        self.whatsapp_client = None
+        if whatsapp_config and admin_phone:
+            self.whatsapp_client = create_whatsapp_client(**whatsapp_config)
+            logger.info(f"Cliente WhatsApp inicializado para notificações ao administrador: {admin_phone}")
+        
+        # Controle de estado de erro e recuperação
+        self.error_state = False
+        self.consecutive_failures = 0
+        self.max_failures_before_alert = 3
+        self.last_error_time = None
+        self.backoff_minutes = 15  # Tempo inicial de espera entre tentativas após falha
+        self.max_backoff_minutes = 120  # Tempo máximo de espera (2 horas)
+        self.last_notification_time = None  # Para evitar spam de notificações
+        self.min_notification_interval = 30  # Intervalo mínimo entre notificações (minutos)
         
         # Dados do token em memória
         self._token_data = None
@@ -76,6 +103,12 @@ class BlingTokenManager:
                 
                 # Atualiza o arquivo .env
                 self._update_env_file()
+                
+                # Reset do estado de erro se o token foi salvo com sucesso
+                self.error_state = False
+                self.consecutive_failures = 0
+                self.last_error_time = None
+                self.backoff_minutes = 15  # Reset do tempo de backoff
                 
             logger.info("Token salvo no arquivo")
         except Exception as e:
@@ -125,17 +158,58 @@ class BlingTokenManager:
         except Exception as e:
             logger.error(f"Erro ao atualizar arquivo .env: {str(e)}")
     
+    async def _should_attempt_recovery(self):
+        """
+        Verifica se deve tentar recuperação baseado no estado de erro e tempo de backoff
+        
+        :return: True se deve tentar recuperação, False caso contrário
+        """
+        if not self.error_state:
+            return True
+            
+        if not self.last_error_time:
+            self.last_error_time = datetime.now()
+            return True
+            
+        # Calcula tempo decorrido desde o último erro
+        elapsed = datetime.now() - self.last_error_time
+        
+        # Tempo de backoff exponencial (2^n) limitado pelo máximo
+        current_backoff = min(self.backoff_minutes * (2 ** (self.consecutive_failures - 1)), 
+                              self.max_backoff_minutes)
+        
+        logger.info(f"Tempo desde último erro: {elapsed.total_seconds() / 60:.1f} minutos, " +
+                   f"Backoff atual: {current_backoff} minutos")
+        
+        # Se o tempo decorrido for maior que o backoff, tenta novamente
+        if elapsed.total_seconds() > (current_backoff * 60):
+            return True
+            
+        return False
+    
     async def refresh_token(self):
         """
         Renova o token usando o refresh_token
         
         :return: True se renovado com sucesso, False caso contrário
         """
+        # Verifica se deve tentar recuperação baseado no estado de backoff
+        if not await self._should_attempt_recovery():
+            logger.warning(f"Em período de backoff, aguardando antes da próxima tentativa")
+            return False
+        
         try:
             with self._token_lock:
                 # Verifica se temos dados de token
                 if not self._token_data or "refresh_token" not in self._token_data:
                     logger.error("Dados de token inexistentes ou incompletos")
+                    
+                    # Primeira falha, tenta recuperação imediata
+                    if self.consecutive_failures == 0:
+                        self.consecutive_failures += 1
+                        self.last_error_time = datetime.now()
+                        await self._attempt_token_recovery()
+                    
                     return False
                 
                 refresh_token = self._token_data["refresh_token"]
@@ -177,12 +251,196 @@ class BlingTokenManager:
                 logger.info(f"Token renovado com sucesso, expira em {new_token_data.get('expires_in', 'N/A')} segundos")
                 return True
             else:
-                logger.error(f"Erro ao renovar token: {response.status_code} - {response.text}")
+                # Incrementa o contador de falhas
+                self.consecutive_failures += 1
+                self.last_error_time = datetime.now()
+                
+                # Detecta erro específico de "invalid_grant"
+                error_message = "Erro desconhecido"
+                is_invalid_grant = False
+                
+                try:
+                    error_data = response.json()
+                    if "error" in error_data:
+                        if isinstance(error_data["error"], dict):
+                            error_type = error_data["error"].get("type")
+                            error_message = error_data["error"].get("message", "Sem detalhes")
+                            is_invalid_grant = error_type == "invalid_grant"
+                        else:
+                            error_type = error_data["error"]
+                            error_message = error_data.get("message", "Sem detalhes")
+                            is_invalid_grant = error_type == "invalid_grant"
+                except Exception as e:
+                    logger.error(f"Erro ao analisar resposta JSON: {str(e)}")
+                    error_message = response.text
+                
+                logger.error(f"Erro ao renovar token: {response.status_code} - {error_message}")
+                
+                # Se for um erro "invalid_grant", tenta recuperação automatizada
+                if is_invalid_grant:
+                    logger.warning("Refresh token inválido ou expirado, tentando recuperação automática")
+                    
+                    # Entra em estado de erro
+                    self.error_state = True
+                    
+                    # Notifica sobre o erro se tiver atingido o limite de falhas consecutivas
+                    if self.consecutive_failures >= self.max_failures_before_alert:
+                        await self._notify_token_failure(error_message)
+                    
+                    # Tenta recuperar o token
+                    await self._attempt_token_recovery()
+                
                 return False
                 
         except Exception as e:
             logger.error(f"Erro durante renovação do token: {str(e)}")
+            
+            # Incrementa contador de falhas
+            self.consecutive_failures += 1
+            self.last_error_time = datetime.now()
+            
+            # Se atingiu limite de falhas, notifica
+            if self.consecutive_failures >= self.max_failures_before_alert:
+                await self._notify_token_failure(str(e))
+            
             return False
+    
+    async def _attempt_token_recovery(self):
+        """
+        Tenta recuperar o token automaticamente quando o refresh token expira
+        """
+        logger.info(f"Tentativa {self.consecutive_failures} de recuperação automática do token")
+        
+        # 1. Tenta usar o webhook para restauração automatizada
+        if self.webhook_url:
+            try:
+                logger.info(f"Enviando requisição para webhook de recuperação: {self.webhook_url}")
+                
+                # Prepara dados para o webhook
+                webhook_data = {
+                    "event": "token_expired",
+                    "client_id": self.client_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "attempts": self.consecutive_failures
+                }
+                
+                # Envia requisição para o webhook
+                webhook_response = requests.post(
+                    self.webhook_url,
+                    json=webhook_data,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10
+                )
+                
+                if webhook_response.status_code in (200, 201, 202, 204):
+                    logger.info(f"Webhook de recuperação enviado com sucesso: {webhook_response.status_code}")
+                    return  # Não faz nada mais, aguarda o webhook responder
+                else:
+                    logger.warning(f"Falha ao chamar webhook: {webhook_response.status_code} - {webhook_response.text}")
+            except Exception as e:
+                logger.error(f"Erro ao enviar webhook de recuperação: {str(e)}")
+        
+        # 2. Se muitas falhas e não tem webhook, tenta backup mais drástico: 
+        # deletar o arquivo de token para forçar nova autenticação
+        if self.consecutive_failures > 10 and os.path.exists(self.token_file):
+            try:
+                # Antes de deletar, faz backup do arquivo
+                backup_file = f"{self.token_file}.bak.{int(time.time())}"
+                
+                with open(self.token_file, "r") as src:
+                    with open(backup_file, "w") as dst:
+                        dst.write(src.read())
+                
+                # Deleta o arquivo de token
+                os.remove(self.token_file)
+                logger.warning(f"Arquivo de token deletado após {self.consecutive_failures} falhas. " +
+                              f"Backup criado em: {backup_file}")
+                
+                # Limpa dados em memória
+                with self._token_lock:
+                    self._token_data = None
+                
+                # Notifica sobre essa ação
+                await self._notify_token_failure(
+                    f"Token foi deletado após {self.consecutive_failures} falhas. " +
+                    "Uma nova autorização completa será necessária no próximo uso."
+                )
+            except Exception as e:
+                logger.error(f"Erro ao deletar arquivo de token: {str(e)}")
+    
+    async def _notify_token_failure(self, error_details):
+        """
+        Notifica sobre falha na recuperação do token via WhatsApp
+        
+        :param error_details: Detalhes do erro
+        """
+        # Verifica se já enviou notificação recentemente (evita spam)
+        if self.last_notification_time:
+            elapsed = datetime.now() - self.last_notification_time
+            if elapsed.total_seconds() < (self.min_notification_interval * 60):
+                logger.info(f"Notificação ignorada (enviada há {elapsed.total_seconds() / 60:.1f} minutos)")
+                return
+        
+        # Prepara a mensagem
+        message = f"""🚨 *ALERTA: TOKEN BLING EXPIRADO* 🚨
+
+⏰ *{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}*
+
+❌ *Problema*: O token do Bling expirou e não foi possível renová-lo automaticamente.
+
+🔄 *Tentativas*: {self.consecutive_failures}
+⚠️ *Erro*: {error_details}
+
+📱 *Ações necessárias*:
+1. Acesse o painel do Bling
+2. Revogue a autorização atual 
+3. Autorize novamente o aplicativo
+4. Obtenha um novo código e use-o para gerar um token
+
+🔗 *Link para autorização*:
+{self.get_auth_url()}
+
+⚠️ Este problema impede a sincronização com o Bling!"""
+        
+        # Envia a mensagem via WhatsApp
+        if self.whatsapp_client and self.admin_phone:
+            try:
+                logger.info(f"Enviando notificação para o WhatsApp: {self.admin_phone}")
+                success = await self.whatsapp_client.send_message(
+                    text=message,
+                    number=self.admin_phone,
+                    message_type=MessageType.TEXT,
+                    simulate_typing=False
+                )
+                
+                if success:
+                    logger.info("Notificação WhatsApp enviada com sucesso")
+                    self.last_notification_time = datetime.now()
+                else:
+                    logger.error("Falha ao enviar notificação via WhatsApp")
+            except Exception as e:
+                logger.error(f"Erro ao enviar notificação via WhatsApp: {str(e)}")
+        else:
+            logger.warning("Cliente WhatsApp não configurado, não é possível enviar notificação")
+        
+        # Log detalhado
+        logger.critical(f"ALERTA CRÍTICO: Falha de token irrecuperável:\n{message}")
+    
+    def get_auth_url(self):
+        """
+        Gera URL para autorização manual
+        
+        :return: URL de autorização
+        """
+        base_url = "https://www.bling.com.br/Api/v3/oauth/authorize"
+        redirect_uri = self.auth_callback_url or "https://b1b9-45-171-45-13.ngrok-free.app/callback"
+        
+        auth_url = (
+            f"{base_url}?response_type=code&client_id={self.client_id}"
+            f"&redirect_uri={redirect_uri}&scope=abilitado&state=autorizacao"
+        )
+        
+        return auth_url
     
     def _is_token_expired_or_expiring_soon(self, threshold_seconds=600):
         """
@@ -224,6 +482,11 @@ class BlingTokenManager:
         
         :return: Token de acesso válido ou None se não for possível obter
         """
+        # Se está em estado de erro, verifica se deve tentar novamente
+        if self.error_state and not await self._should_attempt_recovery():
+            logger.warning("Em estado de erro e período de backoff, não tentando obter token")
+            return None
+        
         with self._token_lock:
             # Se não temos dados de token, não podemos fazer nada
             if not self._token_data or "access_token" not in self._token_data:
@@ -253,11 +516,19 @@ class BlingTokenManager:
         # Retorna o token atual (renovado ou não)
         with self._token_lock:
             token = self._token_data.get("access_token") if self._token_data else None
-            logger.info(f"Retornando token válido: {token[:15]}..." if token else "Nenhum token disponível")
+            if token:
+                logger.info(f"Retornando token válido: {token[:15]}...")
+            else:
+                logger.error("Nenhum token disponível")
             return token
     
     async def _renew_if_needed(self):
         """Verifica e renova o token se necessário"""
+        # Tenta limpar o estado de erro se estiver há muito tempo sem tentar
+        if self.error_state and await self._should_attempt_recovery():
+            logger.info("Saindo do estado de erro para verificar token")
+            self.error_state = False
+        
         with self._token_lock:
             needs_renewal = self._is_token_expired_or_expiring_soon(threshold_seconds=1800)  # 30 minutos
             
@@ -286,8 +557,11 @@ class BlingTokenManager:
                     # Verifica e renova o token se necessário
                     await self._renew_if_needed()
                     
-                    # Espera pelo intervalo (em segundos)
-                    await asyncio.sleep(interval_hours * 60 * 60)
+                    # Se estiver em estado de erro, verifica mais frequentemente
+                    if self.error_state:
+                        await asyncio.sleep(15 * 60)  # 15 minutos
+                    else:
+                        await asyncio.sleep(interval_hours * 60 * 60)  # Tempo normal
                     
                 except asyncio.CancelledError:
                     logger.info("Job de renovação cancelado")
@@ -313,37 +587,38 @@ class BlingTokenManager:
             self._renewal_task.cancel()
             logger.info("Job de renovação cancelado")
     
-    async def ensure_token_file_exists(self, auth_code=None):
+    async def create_token_from_auth_code(self, auth_code, redirect_uri=None):
         """
-        Garante que o arquivo de token existe, criando-o se necessário
+        Cria um novo token usando o código de autorização
         
-        :param auth_code: Código de autorização para obter o token inicial
-        :return: True se o arquivo existe ou foi criado, False caso contrário
+        :param auth_code: Código de autorização do fluxo OAuth
+        :param redirect_uri: URI de redirecionamento (deve ser o mesmo usado na autorização)
+        :return: True se token criado com sucesso, False caso contrário
         """
-        # Se o arquivo já existe, apenas retorna
-        if os.path.exists(self.token_file):
-            return True
-        
-        # Se não temos código de autorização, não podemos criar o arquivo
-        if not auth_code:
-            logger.error("Arquivo de token não existe e nenhum código de autorização fornecido")
-            return False
-        
-        # Tenta obter o token inicial
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
-        payload = {
-            "grant_type": "authorization_code",
-            "code": auth_code,
-            "redirect_uri": "https://b1b9-45-171-45-13.ngrok-free.app/callback"  # Use a URL de callback do seu app
-        }
-        
-        # Autenticação HTTP Basic
-        auth = HTTPBasicAuth(self.client_id, self.client_secret)
-        
         try:
+            # URI de redirecionamento padrão se não fornecido
+            if not redirect_uri and self.auth_callback_url:
+                redirect_uri = self.auth_callback_url
+            elif not redirect_uri:
+                redirect_uri = "https://b1b9-45-171-45-13.ngrok-free.app/callback"  # Valor padrão (ajustar conforme necessário)
+            
+            logger.info(f"Criando novo token a partir do código de autorização")
+            
+            # Prepara a requisição
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            payload = {
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": redirect_uri
+            }
+            
+            # Autenticação HTTP Basic
+            auth = HTTPBasicAuth(self.client_id, self.client_secret)
+            
+            # Faz a requisição
             response = requests.post(
                 self.token_url,
                 data=payload,
@@ -364,86 +639,38 @@ class BlingTokenManager:
                 # Salva o token
                 self._save_token()
                 
-                logger.info("Token inicial obtido e salvo com sucesso")
+                # Reset dos estados de erro
+                self.error_state = False
+                self.consecutive_failures = 0
+                self.last_error_time = None
+                
+                # Notifica sobre o sucesso via WhatsApp
+                if self.whatsapp_client and self.admin_phone:
+                    success_message = f"""✅ *Token Bling Renovado com Sucesso!*
+
+⏰ *{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}*
+
+O token do Bling foi renovado com sucesso e a integração voltou a funcionar normalmente.
+
+📊 *Detalhes:*
+- Validade: {token_data.get('expires_in', 0) // 3600} horas
+- Renovação automática: ✅ Ativada
+
+Nenhuma ação adicional é necessária."""
+
+                    await self.whatsapp_client.send_message(
+                        text=success_message,
+                        number=self.admin_phone,
+                        message_type=MessageType.TEXT,
+                        simulate_typing=False
+                    )
+                
+                logger.info("Token criado com sucesso!")
                 return True
             else:
-                logger.error(f"Erro ao obter token inicial: {response.status_code} - {response.text}")
+                logger.error(f"Erro ao criar token: {response.status_code} - {response.text}")
                 return False
-                
+        
         except Exception as e:
-            logger.error(f"Erro ao obter token inicial: {str(e)}")
+            logger.error(f"Erro ao criar token a partir do código: {str(e)}")
             return False
-
-# Função para renovar o token de forma forçada (útil para scripts)
-async def force_token_renewal(client_id, client_secret):
-    """
-    Força a renovação do token do Bling
-    
-    :param client_id: Client ID do aplicativo Bling
-    :param client_secret: Client Secret do aplicativo Bling
-    :return: True se renovado com sucesso, False caso contrário
-    """
-    token_manager = BlingTokenManager(client_id, client_secret)
-    logger.info("Forçando renovação do token Bling...")
-    success = await token_manager.refresh_token()
-    
-    if success:
-        logger.info("Token renovado com sucesso!")
-        return True
-    else:
-        logger.error("Falha ao renovar token!")
-        return False
-
-
-# Exemplo de uso
-if __name__ == "__main__":
-    # Carrega variáveis de ambiente
-    load_dotenv()
-    
-    # Credenciais do Bling
-    CLIENT_ID = os.environ.get("BLING_CLIENT_ID", "")
-    CLIENT_SECRET = os.environ.get("BLING_CLIENT_SECRET", "")
-    
-    if not CLIENT_ID or not CLIENT_SECRET:
-        logger.error("Variáveis BLING_CLIENT_ID e BLING_CLIENT_SECRET precisam estar definidas")
-        exit(1)
-    
-    # Função de teste assíncrona
-    async def test_token_manager():
-        # Inicializa o gerenciador de token
-        token_manager = BlingTokenManager(
-            client_id=CLIENT_ID,
-            client_secret=CLIENT_SECRET
-        )
-        
-        # Verifica se temos um token válido
-        token = await token_manager.get_valid_token()
-        
-        if token:
-            print(f"Token válido: {token[:15]}...")
-            
-            # Inicia job de renovação para teste
-            token_manager.start_renewal_job(interval_hours=1)
-            
-            # Para demonstração, espera 10 segundos
-            print("Job de renovação iniciado, esperando 10 segundos...")
-            await asyncio.sleep(10)
-            
-            # Para o job
-            token_manager.stop_renewal_job()
-            print("Job de renovação parado")
-        else:
-            print("Não foi possível obter um token válido")
-            
-            # Se não temos token, podemos usar um código de autorização para obter
-            auth_code = input("Digite um código de autorização (ou deixe em branco para sair): ")
-            
-            if auth_code:
-                success = await token_manager.ensure_token_file_exists(auth_code)
-                if success:
-                    print("Token criado com sucesso!")
-                else:
-                    print("Falha ao criar token")
-    
-    # Executa teste
-    asyncio.run(test_token_manager())
