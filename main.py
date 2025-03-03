@@ -8,6 +8,7 @@ import asyncio
 from threading import Thread
 import time
 
+
 # Novas importações
 from stock_agent import StockAgent  # Novo agente de estoque
 from token_manager import BlingTokenManager  # Gerenciador de token melhorado
@@ -65,7 +66,7 @@ async def main():
             auth_callback_url=os.getenv('BLING_CALLBACK_URL', ''),
             webhook_url=os.getenv('BLING_WEBHOOK_RECOVERY_URL', ''),
             whatsapp_config=whatsapp_config,
-            admin_phone=os.getenv('ADMIN_PHONE', '')  # Número para receber alertas
+            admin_phone=os.getenv('ADMIN_PHONE', '5516994015075')  # Número para receber alertas
         )
         
         valid_token = await token_manager.get_valid_token()
@@ -103,7 +104,7 @@ async def main():
         server_thread = Thread(target=lambda: uvicorn.run(
             app,
             host="0.0.0.0",
-            port=5000,
+            port=8000,
             log_level="info"
         ))
         server_thread.daemon = True  # Isso permite que o thread seja encerrado quando o programa principal encerrar
@@ -122,7 +123,7 @@ async def main():
             logger.info("Agente de estoque pronto para processar mensagens")
         
         # Inicia o job de renovação de token para garantir que o token sempre esteja válido
-        token_manager.start_renewal_job(interval_hours=1)
+        token_manager.start_renewal_job(interval_hours=0.5)
         logger.info("Job de renovação de token iniciado (verificação a cada 1 hora)")
         
         # Mantém o programa principal em execução
@@ -178,7 +179,7 @@ async def init_stock_agent(settings, token_manager=None):
                     'api_url': settings.whatsapp.api_url,
                     'instance': settings.whatsapp.instance
                 },
-                admin_phone=os.getenv('ADMIN_PHONE', '')
+                admin_phone=os.getenv('ADMIN_PHONE', '5516994015075')  # Número para receber alertas
             )
         
         # Obter token válido (verificação inicial)
@@ -216,6 +217,10 @@ async def init_stock_agent(settings, token_manager=None):
         import traceback
         logger.error(traceback.format_exc())
         return None
+    
+@app.get("/ping")
+def ping():
+    return {"message": "pong"}   
 
 if __name__ == "__main__":
     try:
